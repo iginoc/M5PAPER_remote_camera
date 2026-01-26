@@ -9,6 +9,7 @@
 #include <time.h>
 #include <math.h>
 #include <WebServer.h>
+#include "driver/adc.h" // Necessario per adc_power_off()
 
 // Inclusione dei font necessari
 // #include <Fonts/GFXFF/FreeSansBold12pt7b.h>
@@ -33,9 +34,10 @@ Preferences preferences;
 int sensorPage = 0;
 const int SENSORS_PER_PAGE = 11; // Numero di sensori per pagina (12 - 1 per Next)
 unsigned long lastActivityTime = 0;
-const unsigned long SLEEP_TIMEOUT = 600000; // 10 minuti di attività prima di dormire
+unsigned long SLEEP_TIMEOUT = 600000; // 10 minuti di attività prima di dormire (default)
 const unsigned long UPDATE_INTERVAL = 10000; // Controlla HA ogni 10 secondi mentre è sveglio
-const uint64_t DEEP_SLEEP_TIME = 10 * 60 * 1000000; // 10 minuti di sonno (in microsecondi)
+uint64_t DEEP_SLEEP_TIME = 10 * 60 * 1000000; // 10 minuti di sonno (in microsecondi) (default)
+bool deepSleepEnabled = true; // Abilitato di default
 
 struct DeviceButton {
   const char* entity_id;
@@ -158,6 +160,7 @@ void handleWifiConfig();
 void handleSaveWifi();
 void handleFactoryReset();
 void handleSetPage();
+void handleDeepSleep();
 String encryptConfig(String input);
 String decryptConfig(String input);
 
@@ -1330,6 +1333,22 @@ void enterDeepSleep() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     
+    // --- OTTIMIZZAZIONI RISPARMIO ENERGETICO ---
+    // 1. Spegni l'ADC, non è necessario durante il sonno.
+    adc_power_off();
+
+    // 2. Configura i pin delle porte di espansione non utilizzate per evitare consumi.
+    //    Questo previene che i pin fluttuino, causando assorbimenti.
+    pinMode(18, INPUT_PULLDOWN); // PORT C
+    pinMode(19, INPUT_PULLDOWN); // PORT C
+    pinMode(25, INPUT_PULLDOWN); // PORT A
+    pinMode(26, INPUT_PULLDOWN); // PORT B
+    pinMode(32, INPUT_PULLDOWN); // PORT A
+    pinMode(33, INPUT_PULLDOWN); // PORT B
+
+    // 3. Spegni i domini di alimentazione RTC non necessari.
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+
     // Configura il risveglio
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, 0); // Risveglio al tocco (GPIO 36 LOW)
     esp_sleep_enable_timer_wakeup(DEEP_SLEEP_TIME); // Risveglio col timer
@@ -1347,6 +1366,17 @@ void handleRoot() {
     html += "<h1>M5Paper Control</h1>";
     html += "<p><strong>Batteria:</strong> " + String(getInternalBatteryPercentage()) + "%</p>";
     html += "<p><strong>Pagina Corrente:</strong> " + String(currentPage) + "</p>";
+
+    if (deepSleepEnabled) {
+        unsigned long remainingMillis = (millis() > lastActivityTime) ? (SLEEP_TIMEOUT - (millis() - lastActivityTime)) : SLEEP_TIMEOUT;
+        if (millis() - lastActivityTime > SLEEP_TIMEOUT) remainingMillis = 0;
+        int remainingSeconds = remainingMillis / 1000;
+        html += "<p><strong>Sleep automatico in:</strong> " + String(remainingSeconds / 60) + "m " + String(remainingSeconds % 60) + "s</p>";
+        html += "<p><a href='/deepsleep' onclick=\"return confirm('Il dispositivo andrà in deep sleep. Per riattivarlo, toccare lo schermo.');\"><button style='background-color:#ff9800;'>Forza Deep Sleep</button></a></p>";
+    } else {
+        html += "<p><strong>Sleep automatico:</strong> Disabilitato</p>";
+    }
+
     html += "<p><a href='/refresh'><button>Aggiorna Schermo</button></a></p>";
     html += "<p><a href='/toggle_dark'><button>Toggle Dark Mode</button></a></p>";
     html += "<p><a href='/screenshot' target='_blank'><button>Screenshot</button></a></p>";
@@ -1360,6 +1390,12 @@ void handleRoot() {
     html += "<p><a href='/status'><button>Stato JSON</button></a></p>";
     html += "</body></html>";
     server.send(200, "text/html", html);
+}
+
+void handleDeepSleep() {
+    server.send(200, "text/html", "<html><body><h1>Deep Sleep...</h1><p>Il dispositivo sta entrando in modalit&agrave; deep sleep. Tocca lo schermo per riattivarlo.</p></body></html>");
+    delay(100); // Give the server a moment to send the response
+    enterDeepSleep();
 }
 
 void handleStatus() {
@@ -1493,6 +1529,17 @@ void handleWifiConfig() {
     html += "<label>Password:</label><br>";
     html += "<input type='password' name='mqtt_password' value='" + mqtt_password + "'><br>";
 
+    html += "<h3>Risparmio Energetico</h3>";
+    html += "<label>Deep Sleep:</label><br>";
+    html += "<select name='ds_enabled'>";
+    html += "<option value='1'" + String(deepSleepEnabled ? " selected" : "") + ">Abilitato</option>";
+    html += "<option value='0'" + String(!deepSleepEnabled ? " selected" : "") + ">Disabilitato</option>";
+    html += "</select><br>";
+    html += "<label>Timeout Inattivit&agrave; (min):</label><br>";
+    html += "<input type='number' name='ds_timeout' value='" + String(SLEEP_TIMEOUT / 60000) + "'><br>";
+    html += "<label>Durata Sleep (min):</label><br>";
+    html += "<input type='number' name='ds_duration' value='" + String((unsigned long)(DEEP_SLEEP_TIME / 60000000ULL)) + "'><br>";
+
     html += "<button type='submit'>Salva e Connetti</button>";
     html += "</form>";
     html += "<p><a href='/'>Indietro</a></p>";
@@ -1518,6 +1565,10 @@ void handleSaveWifi() {
         if (server.hasArg("mqtt_user")) preferences.putString("mqtt_user", encryptConfig(server.arg("mqtt_user")));
         if (server.hasArg("mqtt_password")) preferences.putString("mqtt_password", encryptConfig(server.arg("mqtt_password")));
         
+        if (server.hasArg("ds_enabled")) preferences.putBool("ds_enabled", server.arg("ds_enabled").toInt());
+        if (server.hasArg("ds_timeout")) preferences.putULong("ds_timeout", server.arg("ds_timeout").toInt());
+        if (server.hasArg("ds_duration")) preferences.putULong("ds_duration", server.arg("ds_duration").toInt());
+
         preferences.end();
         
         String html = "<html><body><h1>Salvato!</h1><p>Riavvio in corso...</p></body></html>";
@@ -1692,6 +1743,11 @@ void setup() {
   mqtt_user = decryptConfig(preferences.getString("mqtt_user", mqtt_user));
   mqtt_password = decryptConfig(preferences.getString("mqtt_password", mqtt_password));
 
+  // Carica impostazioni Deep Sleep
+  deepSleepEnabled = preferences.getBool("ds_enabled", true);
+  SLEEP_TIMEOUT = preferences.getULong("ds_timeout", 10) * 60000; // Salvato in minuti, converto in ms
+  DEEP_SLEEP_TIME = (uint64_t)preferences.getULong("ds_duration", 10) * 60 * 1000000ULL; // Salvato in minuti, converto in us
+
   preferences.end();
 
   pinMode(36, INPUT); // Configura il pin del touch per il risveglio
@@ -1749,6 +1805,7 @@ void setup() {
   server.on("/save_wifi", handleSaveWifi);
   server.on("/reset", handleFactoryReset);
   server.on("/set_page", handleSetPage);
+    server.on("/deepsleep", handleDeepSleep);
   server.begin();
   Serial.println("HTTP server started");
 
@@ -2233,10 +2290,10 @@ void loop() {
   }
 
   // Controllo Deep Sleep
-  // DISABILITATO per mantenere il server web attivo
-  // if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
-  //     enterDeepSleep();
-  // }
+  // Riattivato per il risparmio energetico. Commenta questa sezione se vuoi il server web sempre attivo.
+  if (deepSleepEnabled && millis() - lastActivityTime > SLEEP_TIMEOUT) {
+      enterDeepSleep();
+  }
 
   // Gestione robusta della connessione
   if (WiFi.status() == WL_CONNECTED) {
