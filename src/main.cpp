@@ -51,9 +51,9 @@ struct DeviceButton {
 const int NUM_DEVICES = 4;
 DeviceButton devices[NUM_DEVICES] = {
     {"switch.gruppo_switch", "SWITCH", "off", 0, 0, 0, 0, "group"},
-    {"light.gruppo_luci", "LUCI", "off", 0, 0, 0, 0, "group"},
+    {"light.gruppo_luci", "LIGHTS", "off", 0, 0, 0, 0, "group"},
     {"", "HOME", "off", 0, 0, 0, 0, ""},
-    {"", "SENSORI", "off", 0, 0, 0, 0, ""},
+    {"", "SENSORS", "off", 0, 0, 0, 0, ""},
 };
 
 // --- NUOVA GRIGLIA 3x3 ---
@@ -1623,20 +1623,44 @@ void setup() {
   }
 
   if (performReset) {
+      // Attendi che il dito venga sollevato prima di chiedere conferma
+      while (!M5.TP.isFingerUp()) {
+          M5.TP.update();
+          delay(10);
+      }
+
+      // Chiedi conferma
       canvas.fillCanvas(WHITE);
-      canvas.drawString("Reset in corso...", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
+      canvas.drawString("Premi il tasto centrale per confermare", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
       canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
       
-      preferences.begin("epaper", false);
-      preferences.clear();
-      preferences.end();
-      
-      delay(1000);
-      canvas.fillCanvas(WHITE);
-      canvas.drawString("Fatto! Riavvio...", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
-      canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-      delay(1000);
-      ESP.restart();
+      bool confirmed = false;
+      unsigned long confirmStart = millis();
+      while (millis() - confirmStart < 5000) {
+          M5.update(); // Aggiorna lo stato dei pulsanti
+          if (M5.BtnP.wasPressed()) {
+              confirmed = true;
+              break;
+          }
+          delay(10);
+      }
+
+      if (confirmed) {
+          canvas.fillCanvas(WHITE);
+          canvas.drawString("Reset in corso...", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
+          canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+          
+          preferences.begin("epaper", false);
+          preferences.clear();
+          preferences.end();
+          
+          delay(1000);
+          canvas.fillCanvas(WHITE);
+          canvas.drawString("Fatto! Riavvio...", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
+          canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+          delay(1000);
+          ESP.restart();
+      }
   }
   
   canvas.fillCanvas(WHITE);
@@ -1924,6 +1948,20 @@ void drawHeader(M5EPD_Canvas* c) {
   }
   
   String date_str = getSensorState("sensor.oggi");
+
+  // Sostituisci caratteri accentati che potrebbero non essere supportati dal font
+  date_str.replace("à", "a'");
+  date_str.replace("è", "e'");
+  date_str.replace("é", "e'");
+  date_str.replace("ì", "i'");
+  date_str.replace("ò", "o'");
+  date_str.replace("ù", "u'");
+  date_str.replace("À", "A'");
+  date_str.replace("È", "E'");
+  date_str.replace("É", "E'");
+  date_str.replace("Ì", "I'");
+  date_str.replace("Ò", "O'");
+  date_str.replace("Ù", "U'");
 
   if (WiFi.status() != WL_CONNECTED) {
     c->setTextDatum(TC_DATUM);
