@@ -156,6 +156,7 @@ void controlMediaPlayer(String entity_id, String action);
 void drawHotspotControl(); // Sostituisce drawCalendar
 void drawAnalogClock();
 void handleScreenshot();
+void handleViewScreenshot();
 void handleWifiConfig();
 void handleSaveWifi();
 void handleFactoryReset();
@@ -1379,7 +1380,7 @@ void handleRoot() {
 
     html += "<p><a href='/refresh'><button>Aggiorna Schermo</button></a></p>";
     html += "<p><a href='/toggle_dark'><button>Toggle Dark Mode</button></a></p>";
-    html += "<p><a href='/screenshot' target='_blank'><button>Screenshot</button></a></p>";
+    html += "<p><a href='/view_screenshot' target='_blank'><button>Screenshot</button></a></p>";
     html += "<h3>Cambia Pagina</h3>";
     html += "<p><a href='/set_page?page=0'><button>Pagina Sensori</button></a></p>";
     html += "<p><a href='/set_page?page=1'><button>Pagina Home</button></a></p>";
@@ -1424,6 +1425,17 @@ void handleWebToggleDark() {
     drawFullUI(false);
     server.sendHeader("Location", "/");
     server.send(303);
+}
+
+void handleViewScreenshot() {
+    String html = "<!DOCTYPE html><html><head><title>M5Paper Screenshot</title>";
+    html += "<meta http-equiv='refresh' content='5'>"; // Aggiornamento automatico ogni 5 secondi
+    html += "<style>body{margin:0; background-color:#222; display:flex; justify-content:center; align-items:center; height:100vh;} img{max-width:100%; max-height:100%;}</style>";
+    html += "</head><body>";
+    // Aggiungo un parametro timestamp per evitare il caching del browser
+    html += "<img src='/screenshot?t=" + String(millis()) + "' alt='M5Paper Screenshot'>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
 }
 
 void handleScreenshot() {
@@ -1475,7 +1487,11 @@ void handleScreenshot() {
     uint8_t palette[16 * 4];
     for (int i = 0; i < 16; i++) {
         uint8_t val = i * 17; // Scala 0-15 a 0-255
-        if (isDarkMode) val = 255 - val; // Inverti se in Dark Mode per riflettere lo schermo
+        // NOTA: L'inversione della palette in dark mode è stata rimossa.
+        // La funzione M5.EPD.SetColorReverse(isDarkMode) sembra influenzare
+        // direttamente il framebuffer della canvas. Invertire la palette qui
+        // causava una doppia-inversione, risultando in uno screenshot con colori invertiti.
+        // if (isDarkMode) val = 255 - val; // Inverti se in Dark Mode per riflettere lo schermo
         palette[i * 4 + 0] = val; // B
         palette[i * 4 + 1] = val; // G
         palette[i * 4 + 2] = val; // R
@@ -1801,6 +1817,7 @@ void setup() {
   server.on("/refresh", handleWebRefresh);
   server.on("/toggle_dark", handleWebToggleDark);
   server.on("/screenshot", handleScreenshot);
+  server.on("/view_screenshot", handleViewScreenshot);
   server.on("/wifi", handleWifiConfig);
   server.on("/save_wifi", handleSaveWifi);
   server.on("/reset", handleFactoryReset);
