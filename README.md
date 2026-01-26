@@ -2,7 +2,7 @@
 
 Questo progetto trasforma un dispositivo M5Paper in un pannello di controllo touchscreen per Home Assistant, sfruttando il suo display e-ink a basso consumo. L'interfaccia è progettata per essere reattiva, personalizzabile e per massimizzare la durata della batteria attraverso l'uso del deep sleep.
 
-<p align="center"><img src="screenshots/output.gif" width="300" alt="Home Screen" /></p>
+<p align="center"><img src="screenshots/output.gif" width="600" alt="Home Screen" /></p>
 
 ## Caratteristiche
 
