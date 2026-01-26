@@ -52,8 +52,8 @@ const int NUM_DEVICES = 4;
 DeviceButton devices[NUM_DEVICES] = {
     {"switch.gruppo_switch", "SWITCH", "off", 0, 0, 0, 0, "group"},
     {"light.gruppo_luci", "LUCI", "off", 0, 0, 0, 0, "group"},
-    {"scene.relax", "HOME", "off", 0, 0, 0, 0, "scene"},
-    {"script.buonanotte", "SENSORI", "off", 0, 0, 0, 0, "script"},
+    {"", "HOME", "off", 0, 0, 0, 0, ""},
+    {"", "SENSORI", "off", 0, 0, 0, 0, ""},
 };
 
 // --- NUOVA GRIGLIA 3x3 ---
@@ -294,7 +294,9 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
   // Costruiamo dinamicamente la richiesta JSON per il template
   String jsonPayload = "{\"template\":\"{% set entities = [";
   if (update_devices) for (int i = 0; i < NUM_DEVICES; i++) {
-    jsonPayload += "'" + String(devices[i].entity_id) + "',";
+    if (String(devices[i].entity_id) != "") {
+      jsonPayload += "'" + String(devices[i].entity_id) + "',";
+    }
   }
   if (update_devices) for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
     if (gridButtons[i].entity_id != "") {
@@ -304,7 +306,7 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
   for (size_t i = 0; i < sensors.size(); i++) {
     // CORREZIONE: Escludi i sensori di tempo e data dalla richiesta di stato,
     // poiché vengono gestiti in modo speciale e non devono essere richiesti qui.
-    if (sensors[i].attribute == "" && sensors[i].entity_id != "sensor.time") {
+    if (sensors[i].attribute == "" && sensors[i].entity_id != "sensor.time" && sensors[i].entity_id != "sensor.oggi") {
       // Richiesta di stato normale
       jsonPayload += "'" + sensors[i].entity_id + "',";
     }
@@ -331,14 +333,16 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
     if (update_devices) {
       // Aggiorna i pulsanti
       for (int i = 0; i < NUM_DEVICES; i++) {
-        int commaIndex = payload.indexOf(STATE_DELIMITER, lastIndex);
-        int pipeIndex = payload.indexOf(ATTR_DELIMITER, lastIndex);
-        if (commaIndex != -1 && (pipeIndex == -1 || commaIndex < pipeIndex)) currentIndex = commaIndex;
-        else if (pipeIndex != -1) currentIndex = pipeIndex;
-        else currentIndex = payload.length();
+        if (String(devices[i].entity_id) != "") {
+            int commaIndex = payload.indexOf(STATE_DELIMITER, lastIndex);
+            int pipeIndex = payload.indexOf(ATTR_DELIMITER, lastIndex);
+            if (commaIndex != -1 && (pipeIndex == -1 || commaIndex < pipeIndex)) currentIndex = commaIndex;
+            else if (pipeIndex != -1) currentIndex = pipeIndex;
+            else currentIndex = payload.length();
 
-        devices[i].state = payload.substring(lastIndex, currentIndex);
-        if (currentIndex == commaIndex) lastIndex = currentIndex + 1; else lastIndex = currentIndex;
+            devices[i].state = payload.substring(lastIndex, currentIndex);
+            if (currentIndex == commaIndex) lastIndex = currentIndex + 1; else lastIndex = currentIndex;
+        }
       }
       // Aggiorna i pulsanti della griglia
       for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
@@ -357,7 +361,7 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
     if (update_sensors) {
       // Passaggio 1: Aggiorna i sensori che sono STATI
       for (size_t i = 0; i < sensors.size(); i++) {
-        if (sensors[i].attribute == "" && sensors[i].entity_id != "sensor.time") {
+        if (sensors[i].attribute == "" && sensors[i].entity_id != "sensor.time" && sensors[i].entity_id != "sensor.oggi") {
           int commaIndex = payload.indexOf(STATE_DELIMITER, lastIndex);
           int pipeIndex = payload.indexOf(ATTR_DELIMITER, lastIndex);
           
