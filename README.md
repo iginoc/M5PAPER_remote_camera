@@ -2,7 +2,7 @@
 
 Questo progetto trasforma un dispositivo M5Paper in un pannello di controllo touchscreen per Home Assistant, sfruttando il suo display e-ink a basso consumo. L'interfaccia è progettata per essere reattiva, personalizzabile e per massimizzare la durata della batteria attraverso l'uso del deep sleep.
 
-![placeholder_screenshot](https://via.placeholder.com/540x960.png?text=UI+Screenshot)
+<p align="center"><img src="screenshots/home.bmp" width="300" alt="Home Screen" /></p>
 
 ## Caratteristiche
 
@@ -114,9 +114,9 @@ L'interfaccia è divisa in tre sezioni principali:
 ### Funzionalità delle Pagine
 
 - **Pagina Sensori**: Mostra una griglia di sensori dal `gruppo_sensori`. Se i sensori sono più di 11, appare un pulsante "NEXT" per sfogliare le pagine. Toccando un sensore si apre il suo grafico storico.
-- **Pagina Home**: Pagina personalizzabile. Di default, contiene un pulsante per attivare/disattivare l'hotspot WiFi e un link alla pagina "Musica".
+- **Pagina Home**: Pagina personalizzabile. Di default, contiene un pulsante per attivare/disattivare l'hotspot WiFi e un link alla pagina "Script".
 - **Pagina Luci/Switch**: Mostra una griglia di luci o switch presi dai rispettivi gruppi. Un tocco su un pulsante ne commuta lo stato. Un tocco prolungato (o un secondo tocco) su una luce apre la pagina di controllo dettagliato.
-- **Pagina Musica**: Mostra una griglia di `script` di Home Assistant, utile per avviare playlist o automazioni musicali.
+- **Pagina Script**: Mostra una griglia di `script` di Home Assistant, utile per avviare playlist o automazioni.
 - **Pagina Controllo Luce**: Permette di accendere/spegnere la luce e di regolarne la luminosità tramite uno slider.
 - **Pagina Grafico**: Mostra l'andamento di un sensore. Tocca il titolo per cambiare l'intervallo di tempo visualizzato (24h -> 6h -> 12h).
 
@@ -126,11 +126,11 @@ Dopo 10 minuti di inattività, il dispositivo entra in modalità deep sleep per 
 
 ## Screenshot
 
-*Inserisci qui gli screenshot della tua interfaccia.*
-
-!Schermata Sensori
-!Schermata Luci
-!Schermata Grafico
+<p float="left" align="center">
+  <img src="screenshots/sensors.png" width="260" alt="Schermata Sensori" />
+  <img src="screenshots/lights.png" width="260" alt="Schermata Luci" />
+  <img src="screenshots/graph.png" width="260" alt="Schermata Grafico" />
+</p>
 
 ## Licenza
 

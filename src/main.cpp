@@ -100,9 +100,9 @@ String currentGraphEntityId = "";
 String currentGraphName = "";
 int currentGraphDuration = 24;
 
-const int CLOCK_PAGE = 6; // Pagina orologio analogico
-const int CALENDAR_PAGE = 7; // Pagina calendario
-const int MUSIC_PAGE = 8; // Pagina musica
+const int CLOCK_PAGE = 6;         // Pagina orologio analogico
+const int CALENDAR_PAGE = 7;      // Pagina calendario
+const int SCRIPT_PAGE = 8;        // Pagina script
 const int MEDIA_CONTROL_PAGE = 9; // Pagina controllo media
 // --- STATO CONTROLLO LUCE ---
 const int LIGHT_CONTROL_PAGE = 5;
@@ -137,7 +137,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void loadGroupLights();
 void loadGroupSwitches();
 void loadGroupSensors();
-void loadGroupMusic();
+void loadGroupScripts();
 void reconnectMqtt();
 void drawHeader(M5EPD_Canvas* c = &canvas);
 void updateTimeAndDateStates(); 
@@ -442,13 +442,13 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
            wifi_mode_t mode = WiFi.getMode();
            gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
            gridButtons[1].entity_id = "";
-           gridButtons[1].name = "Musica";
-           gridButtons[1].type = "music_page";
+           gridButtons[1].name = "Script";
+           gridButtons[1].type = "script_page";
            gridButtons[1].state = "off";
         } else if (currentPage == 0) {
            loadGroupSensors();
-        } else if (currentPage == MUSIC_PAGE) {
-           loadGroupMusic();
+        } else if (currentPage == SCRIPT_PAGE) {
+           loadGroupScripts();
         }
         }
       }
@@ -622,7 +622,7 @@ void drawSensors() {
             }
 
             int iconX = x + 20;
-            int iconY = y + btn_h/2;
+            int iconY = y + btn_h/2 - 10; // Alza l'icona di 10px
             
             if (sensors[idx].entity_id.indexOf("battery") != -1 || sensors[idx].entity_id.indexOf("livello") != -1) {
                 unit = "%";
@@ -642,7 +642,7 @@ void drawSensors() {
             // Disegna Valore (Grande) - Allineato a destra
             canvas.setFreeFont(&FreeSansBold18pt7b);
             canvas.setTextDatum(MR_DATUM);
-            int valY = y + btn_h/2 - 15;
+            int valY = y + btn_h/2 - 25; // Alza il valore di 10px
             int valX = x + btn_w - 20;
             
             canvas.drawString(valStr + unit, valX, valY);
@@ -651,7 +651,7 @@ void drawSensors() {
             canvas.setFreeFont(&FreeSans12pt7b);
             canvas.setTextDatum(ML_DATUM);
             int nameX = x + 10;
-            int nameY = y + btn_h/2 + 25;
+            int nameY = y + btn_h/2 + 15; // Alza il nome di 10px
             int maxNameWidth = btn_w - 20;
             String name = sensors[idx].name;
             if (canvas.textWidth(name) > maxNameWidth) {
@@ -856,7 +856,7 @@ void loadGroupSwitches() {
   hideBusyIndicator();
 }
 
-void loadGroupMusic() {
+void loadGroupScripts() {
   if (homeAssistantAddress == "") return;
   showBusyIndicator();
   if (WiFi.status() != WL_CONNECTED) return;
@@ -1752,7 +1752,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println("Message arrived on topic: " + topicStr);
 
   // Se arriva un messaggio sul topic di aggiornamento, ridisegna tutto (tranne pagine speciali).
-  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != MUSIC_PAGE) {
+  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE) {
     Serial.println("Update command received via MQTT. Refreshing screen...");
     // CORREZIONE: Esegui un aggiornamento parziale invece di un refresh completo.
     updateStates(true, true); // Ottieni i nuovi stati
@@ -1885,8 +1885,8 @@ void drawFullUI(bool syncPage) {
           wifi_mode_t mode = WiFi.getMode();
           gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
            gridButtons[1].entity_id = "";
-           gridButtons[1].name = "Musica";
-           gridButtons[1].type = "music_page";
+           gridButtons[1].name = "Script";
+           gridButtons[1].type = "script_page";
            gridButtons[1].state = "off";
            for (int k = 2; k < NUM_GRID_BUTTONS; k++) {
                gridButtons[k].name = "";
@@ -2151,7 +2151,7 @@ void loop() {
   if (millis() - lastUpdate > UPDATE_INTERVAL) {
       lastUpdate = millis();
       // Non aggiornare se siamo in pagine speciali (controllo, grafico, musica, ecc.)
-      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != MUSIC_PAGE) {
+      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE) {
           // Se updateStates ritorna true, significa che la pagina è cambiata
           bool pageChanged = updateStates(true, true);
           if (pageChanged) {
@@ -2186,7 +2186,7 @@ void loop() {
           drawHeader();
           drawAnalogClock();
           canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-      } else if (currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != MUSIC_PAGE) {
+      } else if (currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE) {
           M5EPD_Canvas headerCanvas(&M5.EPD);
           headerCanvas.createCanvas(M5EPD_PANEL_W, 80);
           drawHeader(&headerCanvas);
@@ -2351,8 +2351,8 @@ void loop() {
               gridButtons[0].type = "hotspot";
               wifi_mode_t mode = WiFi.getMode();
               gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
-              gridButtons[1].name = "Musica";
-              gridButtons[1].type = "music_page";
+              gridButtons[1].name = "Script";
+              gridButtons[1].type = "script_page";
 
               drawHeader();
               drawButtons();
@@ -2379,7 +2379,7 @@ void loop() {
       }
 
       // Controlla se il tocco è all'interno di uno dei pulsanti della griglia
-      if (currentPage == 1 || currentPage == 2 || currentPage == 3 || currentPage == MUSIC_PAGE) {
+      if (currentPage == 1 || currentPage == 2 || currentPage == 3 || currentPage == SCRIPT_PAGE) {
        for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
         if (finger.x >= gridButtons[i].x && finger.x <= (gridButtons[i].x + gridButtons[i].w) &&
             finger.y >= gridButtons[i].y && finger.y <= (gridButtons[i].y + gridButtons[i].h)) {
@@ -2421,10 +2421,10 @@ void loop() {
                drawGridButtons();
                canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
                break;
-          } else if (String(gridButtons[i].type) == "music_page") {
-               // Vai alla pagina Musica
-               currentPage = MUSIC_PAGE;
-               loadGroupMusic();
+          } else if (String(gridButtons[i].type) == "script_page") {
+               // Vai alla pagina Script
+               currentPage = SCRIPT_PAGE;
+               loadGroupScripts();
                drawHeader();
                drawButtons();
                drawGridButtons();
