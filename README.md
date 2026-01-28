@@ -67,6 +67,13 @@ group:
       - light.luce_cucina
       # Add more lights here
 
+  all_events:
+    name: All Calendars
+    entities:
+      - calendar.personal_calendar
+      - calendar.work_calendar
+      # Add all your calendar entities here. This group is used by the M5Paper to fetch today's appointments.
+
   gruppo_switch:
     name: Epaper Switches Group
     entities:
@@ -260,6 +267,7 @@ L'interfaccia è divisa in tre sezioni principali:
 - **Pagina Home**: Pagina personalizzabile. Di default, contiene un pulsante per attivare/disattivare l'hotspot WiFi e un link alla pagina "Script".
 - **Pagina Luci/Switch**: Mostra una griglia di luci o switch presi dai rispettivi gruppi. Un tocco su un pulsante ne commuta lo stato. Un tocco prolungato (o un secondo tocco) su una luce apre la pagina di controllo dettagliato.
 - **Pagina Script**: Mostra una griglia di `script` di Home Assistant, utile per avviare playlist o automazioni.
+- **Pagina Appuntamenti**: Mostra gli appuntamenti di oggi presi da Home Assistant (richiede un'entità `calendar.all_events` configurata).
 - **Pagina Controllo Luce**: Permette di accendere/spegnere la luce e di regolarne la luminosità tramite uno slider.
 - **Pagina Grafico**: Mostra l'andamento di un sensore. Tocca il titolo per cambiare l'intervallo di tempo visualizzato (24h -> 6h -> 12h).
 

@@ -119,6 +119,16 @@ String selectedMediaName = "";
 String selectedMediaState = "off";
 float selectedMediaVolume = 0.0; // Volume è un float da 0.0 a 1.0
 
+const int APPOINTMENTS_PAGE = 10; // Nuova pagina per gli appuntamenti
+const int WEEK_VIEW_PAGE = 11;    // Nuova pagina per la vista settimanale
+struct CalendarEvent {
+    String summary;
+    String startTime;
+    String endTime;
+};
+std::vector<CalendarEvent> todayEvents; // Variabile globale per gli eventi di oggi
+std::vector<CalendarEvent> weekEvents; // Aggiunto per gli eventi della settimana
+
 // --- STATO CALENDARIO ---
 int calendarMonthOffset = 0;
 
@@ -150,6 +160,10 @@ void fetchLightDetails(String entity_id);
 void setLightBrightness(String entity_id, int brightness);
 void drawLightControlPage();
 void drawMediaControlPage();
+std::vector<CalendarEvent> fetchTodayCalendarEvents();
+void drawAppointmentsPage();
+std::vector<CalendarEvent> fetchWeekCalendarEvents();
+void drawWeekView();
 void fetchMediaDetails(String entity_id);
 void setMediaVolume(String entity_id, float volume);
 void controlMediaPlayer(String entity_id, String action);
@@ -1336,7 +1350,7 @@ void enterDeepSleep() {
     
     // --- OTTIMIZZAZIONI RISPARMIO ENERGETICO ---
     // 1. Spegni l'ADC, non è necessario durante il sonno.
-    adc_power_off();
+    // adc_power_off(); // Deprecated
 
     // 2. Configura i pin delle porte di espansione non utilizzate per evitare consumi.
     //    Questo previene che i pin fluttuino, causando assorbimenti.
@@ -1850,7 +1864,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println("Message arrived on topic: " + topicStr);
 
   // Se arriva un messaggio sul topic di aggiornamento, ridisegna tutto (tranne pagine speciali).
-  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE) {
+  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE) {
     Serial.println("Update command received via MQTT. Refreshing screen...");
     // CORREZIONE: Esegui un aggiornamento parziale invece di un refresh completo.
     updateStates(true, true); // Ottieni i nuovi stati
@@ -1974,7 +1988,9 @@ void drawFullUI(bool syncPage) {
   drawHeader();
   drawButtons();
   if (currentPage == 0) drawSensors(); 
-  else if (currentPage == CLOCK_PAGE) drawAnalogClock();
+  else if (currentPage == CLOCK_PAGE) drawAnalogClock(); // Existing logic
+  else if (currentPage == APPOINTMENTS_PAGE) drawAppointmentsPage(); // New logic for appointments
+  else if (currentPage == WEEK_VIEW_PAGE) drawWeekView();
   else {
       if (currentPage == 1) {
           gridButtons[0].entity_id = "";
@@ -2253,6 +2269,70 @@ void drawGraph(String entity_id, String name, int hours) {
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
 }
 
+void drawAppointmentsPage() {
+    const int header_height = 80;
+    const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
+    const int col2_width = M5EPD_PANEL_W - col2_start_x;
+    const int area_h = M5EPD_PANEL_H - header_height;
+
+    // Pulisci area
+    canvas.fillRect(col2_start_x, header_height, col2_width, area_h, WHITE);
+
+    // Titolo
+    canvas.setFreeFont(&FreeSansBold18pt7b);
+    canvas.setTextColor(BLACK);
+    canvas.setTextDatum(TC_DATUM);
+    canvas.drawString("Appuntamenti di Oggi", col2_start_x + col2_width / 2, header_height + 30);
+
+    todayEvents = fetchTodayCalendarEvents();
+
+    if (todayEvents.empty()) {
+        canvas.setFreeFont(&FreeSans12pt7b);
+        canvas.drawString("Nessun appuntamento per oggi.", col2_start_x + col2_width / 2, header_height + 100);
+    } else {
+        canvas.setFreeFont(&FreeSans12pt7b);
+        canvas.setTextDatum(TL_DATUM);
+        int y_pos = header_height + 80;
+        for (const auto& event : todayEvents) {
+            // Formatta l'ora (es. "09:00 - 10:00")
+            String startTimeFormatted = event.startTime.substring(11, 16); // Estrai HH:MM
+            String endTimeFormatted = event.endTime.substring(11, 16);   // Estrai HH:MM
+            String eventText = startTimeFormatted + " - " + endTimeFormatted + ": " + event.summary;
+            
+            // Gestione del ritorno a capo se il testo è troppo lungo
+            int max_width = col2_width - 40; // 20px di padding per lato
+            int current_x = col2_start_x + 20;
+
+            String remainingText = eventText;
+            while (remainingText.length() > 0) {
+                String line = "";
+                int lastSpace = -1;
+                for (int i = 0; i < remainingText.length(); ++i) {
+                    String testLine = line + remainingText.charAt(i);
+                    if (canvas.textWidth(testLine) > max_width) {
+                        if (lastSpace != -1) {
+                            line = remainingText.substring(0, lastSpace);
+                            remainingText = remainingText.substring(lastSpace + 1);
+                        } else {
+                            line = testLine; // Parola singola troppo lunga, la taglia
+                            remainingText = "";
+                        }
+                        break;
+                    }
+                    if (remainingText.charAt(i) == ' ') lastSpace = i;
+                    line = testLine;
+                    if (i == remainingText.length() - 1) remainingText = ""; // Ultima parte del testo
+                }
+                canvas.drawString(line, current_x, y_pos);
+                y_pos += 20; // Altezza riga
+                if (y_pos > M5EPD_PANEL_H - 20) break; // Evita di disegnare fuori schermo
+            }
+            y_pos += 10; // Spazio extra tra gli eventi
+        }
+    }
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+}
+
 void loop() {
   // Gestione richieste Web
   server.handleClient();
@@ -2263,7 +2343,7 @@ void loop() {
   if (millis() - lastUpdate > UPDATE_INTERVAL) {
       lastUpdate = millis();
       // Non aggiornare se siamo in pagine speciali (controllo, grafico, musica, ecc.)
-      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE) {
+      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE) {
           // Se updateStates ritorna true, significa che la pagina è cambiata
           bool pageChanged = updateStates(true, true);
           if (pageChanged) {
@@ -2396,13 +2476,34 @@ void loop() {
               while(!M5.TP.isFingerUp()) { M5.TP.update(); }
               return;
           }
-          // Controllo tocco Data (Lato destro) -> Vai al Calendario
-          else if (finger.x > M5EPD_PANEL_W - 400) {
-              Serial.println("Tapped Date: Showing Calendar");
-              currentPage = CALENDAR_PAGE;
-              drawHeader();
-              drawButtons();
-              drawCalendar();
+          // Controllo tocco Data (Lato destro) -> Cicla tra Appuntamenti/Calendario/Settimana
+          else if (finger.x > M5EPD_PANEL_W - 400) { // Tocco sulla data
+              if (currentPage == APPOINTMENTS_PAGE) {
+                  Serial.println("Tapped Date: Showing Calendar");
+                  currentPage = CALENDAR_PAGE;
+                  calendarMonthOffset = 0; // Reset a mese corrente
+                  drawHeader();
+                  drawButtons();
+                  drawCalendar();
+              } else if (currentPage == CALENDAR_PAGE) {
+                  Serial.println("Tapped Date: Showing Week View");
+                  currentPage = WEEK_VIEW_PAGE;
+                  drawHeader();
+                  drawButtons();
+                  drawWeekView();
+              } else if (currentPage == WEEK_VIEW_PAGE) {
+                  Serial.println("Tapped Date: Showing Today's Appointments");
+                  currentPage = APPOINTMENTS_PAGE;
+                  drawHeader();
+                  drawButtons();
+                  drawAppointmentsPage();
+              } else {
+                  Serial.println("Tapped Date: Showing Today's Appointments");
+                  currentPage = APPOINTMENTS_PAGE;
+                  drawHeader();
+                  drawButtons();
+                  drawAppointmentsPage();
+              }
               canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
               while(!M5.TP.isFingerUp()) { M5.TP.update(); }
               return;
@@ -2781,6 +2882,275 @@ void controlMediaPlayer(String entity_id, String action) {
     String jsonPayload = "{\"entity_id\":\"" + entity_id + "\"}";
     http.POST(jsonPayload);
     http.end();
+}
+
+std::vector<CalendarEvent> fetchTodayCalendarEvents() {
+    std::vector<CalendarEvent> events;
+    if (homeAssistantAddress == "" || WiFi.status() != WL_CONNECTED) return events;
+
+    showBusyIndicator();
+    HTTPClient http;
+    WiFiClient client;
+
+    String apiUrl = homeAssistantAddress + "/api/services/calendar/get_events";
+    http.begin(client, apiUrl);
+    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
+    http.addHeader("Content-Type", "application/json");
+
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("Failed to obtain time for calendar events.");
+        hideBusyIndicator();
+        return events;
+    }
+
+    char start_time_buffer[30];
+    char end_time_buffer[30];
+    // Home Assistant expects ISO 8601 format. Using UTC for simplicity.
+    strftime(start_time_buffer, sizeof(start_time_buffer), "%Y-%m-%dT00:00:00Z", &timeinfo); // Start of today UTC
+    strftime(end_time_buffer, sizeof(end_time_buffer), "%Y-%m-%dT23:59:59Z", &timeinfo);   // End of today UTC
+
+    // Assumiamo un'entità calendario che aggrega tutti gli eventi, es. calendar.all_events
+    // L'utente deve configurare questa entità in Home Assistant se vuole eventi da più calendari.
+    String jsonPayload = "{\"entity_id\":\"calendar.all_events\", \"start_date_time\":\"" + String(start_time_buffer) + "\", \"end_date_time\":\"" + String(end_time_buffer) + "\"}";
+
+    int httpResponseCode = http.POST(jsonPayload);
+    if (httpResponseCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        Serial.println("Calendar Events Payload: " + payload);
+
+        // Parsing manuale della risposta JSON
+        // Formato atteso: {"calendar.all_events": [{"summary": "...", "start": "...", "end": "..."}, ...]}
+        // Trova l'array associato a "calendar.all_events"
+        int calendarEntityKeyStart = payload.indexOf("\"calendar.all_events\":");
+        if (calendarEntityKeyStart != -1) {
+            int arrayStart = payload.indexOf("[", calendarEntityKeyStart);
+            int arrayEnd = payload.indexOf("]", arrayStart);
+            if (arrayStart != -1 && arrayEnd != -1) {
+                String eventsArrayStr = payload.substring(arrayStart + 1, arrayEnd);
+                int currentPos = 0;
+                while (currentPos < eventsArrayStr.length()) {
+                    int objStart = eventsArrayStr.indexOf("{", currentPos);
+                    if (objStart == -1) break;
+                    int objEnd = eventsArrayStr.indexOf("}", objStart);
+                    if (objEnd == -1) break;
+
+                    String eventObjStr = eventsArrayStr.substring(objStart, objEnd + 1);
+                    CalendarEvent newEvent;
+
+                    // Estrai summary
+                    int summaryKey = eventObjStr.indexOf("\"summary\":\"");
+                    if (summaryKey != -1) {
+                        int valStart = summaryKey + 11;
+                        int valEnd = eventObjStr.indexOf("\"", valStart);
+                        if (valEnd != -1) newEvent.summary = eventObjStr.substring(valStart, valEnd);
+                    }
+                    // Estrai start
+                    int startKey = eventObjStr.indexOf("\"start\":\"");
+                    if (startKey != -1) {
+                        int valStart = startKey + 9;
+                        int valEnd = eventObjStr.indexOf("\"", valStart);
+                        if (valEnd != -1) newEvent.startTime = eventObjStr.substring(valStart, valEnd);
+                    }
+                    // Estrai end
+                    int endKey = eventObjStr.indexOf("\"end\":\"");
+                    if (endKey != -1) {
+                        int valStart = endKey + 7;
+                        int valEnd = eventObjStr.indexOf("\"", valStart);
+                        if (valEnd != -1) newEvent.endTime = eventObjStr.substring(valStart, valEnd);
+                    }
+
+                    events.push_back(newEvent);
+                    currentPos = objEnd + 1;
+                    if (eventsArrayStr.indexOf(",", currentPos) == currentPos) { // Salta la virgola se presente
+                        currentPos++;
+                    }
+                }
+            }
+        }
+    } else {
+        Serial.printf("[HTTP] Calendar events fetch failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
+    hideBusyIndicator();
+    return events;
+}
+
+std::vector<CalendarEvent> fetchWeekCalendarEvents() {
+    std::vector<CalendarEvent> events;
+    if (homeAssistantAddress == "" || WiFi.status() != WL_CONNECTED) return events;
+
+    showBusyIndicator();
+    HTTPClient http;
+    WiFiClient client;
+
+    String apiUrl = homeAssistantAddress + "/api/services/calendar/get_events";
+    http.begin(client, apiUrl);
+    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
+    http.addHeader("Content-Type", "application/json");
+
+    time_t now_ts;
+    time(&now_ts);
+    struct tm timeinfo;
+    localtime_r(&now_ts, &timeinfo);
+
+    // Calcola l'inizio della settimana (Lunedì)
+    int day_offset = (timeinfo.tm_wday == 0) ? 6 : timeinfo.tm_wday - 1;
+    timeinfo.tm_mday -= day_offset;
+    timeinfo.tm_hour = 0;
+    timeinfo.tm_min = 0;
+    timeinfo.tm_sec = 0;
+    time_t start_of_week_ts = mktime(&timeinfo);
+
+    // Calcola la fine della settimana (Domenica)
+    time_t end_of_week_ts = start_of_week_ts + (7 * 24 * 3600) - 1;
+
+    struct tm start_tm;
+    struct tm end_tm;
+    gmtime_r(&start_of_week_ts, &start_tm);
+    gmtime_r(&end_of_week_ts, &end_tm);
+
+    char start_time_buffer[30];
+    char end_time_buffer[30];
+    strftime(start_time_buffer, sizeof(start_time_buffer), "%Y-%m-%dT%H:%M:%SZ", &start_tm);
+    strftime(end_time_buffer, sizeof(end_time_buffer), "%Y-%m-%dT%H:%M:%SZ", &end_tm);
+
+    // Assumiamo un'entità calendario che aggrega tutti gli eventi, es. calendar.all_events
+    // L'utente deve configurare questa entità in Home Assistant se vuole eventi da più calendari.
+    String jsonPayload = "{\"entity_id\":\"calendar.all_events\", \"start_date_time\":\"" + String(start_time_buffer) + "\", \"end_date_time\":\"" + String(end_time_buffer) + "\"}";
+
+    int httpResponseCode = http.POST(jsonPayload);
+    if (httpResponseCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        Serial.println("Weekly Calendar Events Payload: " + payload);
+
+        // Parsing manuale della risposta JSON
+        // Formato atteso: {"calendar.all_events": [{"summary": "...", "start": "...", "end": "..."}, ...]}
+        int calendarEntityKeyStart = payload.indexOf("\"calendar.all_events\":");
+        if (calendarEntityKeyStart != -1) {
+            int arrayStart = payload.indexOf("[", calendarEntityKeyStart);
+            int arrayEnd = payload.indexOf("]", arrayStart);
+            if (arrayStart != -1 && arrayEnd != -1) {
+                String eventsArrayStr = payload.substring(arrayStart + 1, arrayEnd);
+                int currentPos = 0;
+                while (currentPos < eventsArrayStr.length()) {
+                    int objStart = eventsArrayStr.indexOf("{", currentPos);
+                    if (objStart == -1) break;
+                    int objEnd = eventsArrayStr.indexOf("}", objStart);
+                    if (objEnd == -1) break;
+
+                    String eventObjStr = eventsArrayStr.substring(objStart, objEnd + 1);
+                    CalendarEvent newEvent;
+
+                    // Estrai summary
+                    int summaryKey = eventObjStr.indexOf("\"summary\":\"");
+                    if (summaryKey != -1) {
+                        int valStart = summaryKey + 11;
+                        int valEnd = eventObjStr.indexOf("\"", valStart);
+                        if (valEnd != -1) newEvent.summary = eventObjStr.substring(valStart, valEnd);
+                    }
+                    // Estrai start
+                    int startKey = eventObjStr.indexOf("\"start\":\"");
+                    if (startKey != -1) {
+                        int valStart = startKey + 9;
+                        int valEnd = eventObjStr.indexOf("\"", valStart);
+                        if (valEnd != -1) newEvent.startTime = eventObjStr.substring(valStart, valEnd);
+                    }
+                    // Estrai end
+                    int endKey = eventObjStr.indexOf("\"end\":\"");
+                    if (endKey != -1) {
+                        int valStart = endKey + 7;
+                        int valEnd = eventObjStr.indexOf("\"", valStart);
+                        if (valEnd != -1) newEvent.endTime = eventObjStr.substring(valStart, valEnd);
+                    }
+
+                    events.push_back(newEvent);
+                    currentPos = objEnd + 1;
+                    if (eventsArrayStr.indexOf(",", currentPos) == currentPos) { // Salta la virgola se presente
+                        currentPos++;
+                    }
+                }
+            }
+        }
+    } else {
+        Serial.printf("[HTTP] Weekly calendar events fetch failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
+    hideBusyIndicator();
+    return events;
+}
+
+void drawWeekView() {
+    const int header_height = 80;
+    const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
+    const int col2_width = M5EPD_PANEL_W - col2_start_x;
+    const int area_h = M5EPD_PANEL_H - header_height;
+
+    // Pulisci area
+    canvas.fillRect(col2_start_x, header_height, col2_width, area_h, WHITE);
+
+    // Titolo
+    canvas.setFreeFont(&FreeSansBold18pt7b);
+    canvas.setTextColor(BLACK);
+    canvas.setTextDatum(TC_DATUM);
+    canvas.drawString("Settimana Corrente", col2_start_x + col2_width / 2, header_height + 30);
+
+    weekEvents = fetchWeekCalendarEvents();
+
+    if (weekEvents.empty()) {
+        canvas.setFreeFont(&FreeSans12pt7b);
+        canvas.drawString("Nessun appuntamento in settimana.", col2_start_x + col2_width / 2, header_height + 100);
+    } else {
+        canvas.setFreeFont(&FreeSans9pt7b); // Font più piccolo per più info
+        canvas.setTextDatum(TL_DATUM);
+        int y_pos = header_height + 70;
+        const char* weekDays[] = {"Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"};
+
+        for (int i = 0; i < 7; i++) {
+            if (y_pos > M5EPD_PANEL_H - 40) break; // Stop if out of space
+
+            // Disegna il giorno della settimana
+            canvas.setFreeFont(&FreeSansBold12pt7b);
+            canvas.drawString(weekDays[i], col2_start_x + 20, y_pos);
+            y_pos += 25;
+
+            // Filtra e disegna eventi per quel giorno
+            canvas.setFreeFont(&FreeSans9pt7b);
+            bool eventFoundForDay = false;
+            for (const auto& event : weekEvents) {
+                // Estrai il giorno della settimana dall'evento (stringa ISO)
+                struct tm event_tm = {0};
+                strptime(event.startTime.c_str(), "%Y-%m-%dT%H:%M:%S", &event_tm);
+                int event_wday = (event_tm.tm_wday == 0) ? 6 : event_tm.tm_wday - 1; // 0=Mon, ... 6=Sun
+                
+                if (event_wday == i) {
+                    eventFoundForDay = true;
+                    if (y_pos > M5EPD_PANEL_H - 20) break;
+
+                    String startTimeFormatted = event.startTime.substring(11, 16);
+                    String eventText = startTimeFormatted + " " + event.summary;
+                    
+                    // Semplice troncamento se troppo lungo
+                    int max_width = col2_width - 50;
+                    if (canvas.textWidth(eventText) > max_width) {
+                        String ellipsis = "...";
+                        while(eventText.length() > 0 && canvas.textWidth(eventText + ellipsis) > max_width) {
+                            eventText.remove(eventText.length()-1);
+                        }
+                        eventText += ellipsis;
+                    }
+
+                    canvas.drawString(eventText, col2_start_x + 30, y_pos);
+                    y_pos += 18;
+                }
+            }
+            if (!eventFoundForDay) {
+                canvas.drawString(" - Nessun evento -", col2_start_x + 30, y_pos);
+                y_pos += 18;
+            }
+            y_pos += 10; // Spazio tra i giorni
+        }
+    }
 }
 
 void drawMediaControlPage() {
