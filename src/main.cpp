@@ -1693,74 +1693,7 @@ void setup() {
   M5.begin();
   Serial.begin(115200);
 
-  // --- PROMPT RESET IMPOSTAZIONI ---
-  M5.EPD.Clear(true);
-  M5.EPD.SetColorReverse(false);
-  canvas.createCanvas(M5EPD_PANEL_W, M5EPD_PANEL_H);
-  canvas.fillCanvas(WHITE);
-  canvas.setTextColor(BLACK);
-  canvas.setFreeFont(&FreeSansBold18pt7b);
-  canvas.setTextDatum(MC_DATUM);
-  canvas.drawString("Tocca per RESETTARE", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
-  canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-
-  unsigned long startWait = millis();
-  bool performReset = false;
-  while (millis() - startWait < 3000) {
-      M5.TP.update();
-      if (!M5.TP.isFingerUp()) {
-          performReset = true;
-          break;
-      }
-      delay(10);
-  }
-
-  if (performReset) {
-      // Attendi che il dito venga sollevato prima di chiedere conferma
-      while (!M5.TP.isFingerUp()) {
-          M5.TP.update();
-          delay(10);
-      }
-
-      // Chiedi conferma
-      canvas.fillCanvas(WHITE);
-      canvas.drawString("Premi il tasto centrale per confermare", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
-      canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-      
-      bool confirmed = false;
-      unsigned long confirmStart = millis();
-      while (millis() - confirmStart < 5000) {
-          M5.update(); // Aggiorna lo stato dei pulsanti
-          if (M5.BtnP.wasPressed()) {
-              confirmed = true;
-              break;
-          }
-          delay(10);
-      }
-
-      if (confirmed) {
-          canvas.fillCanvas(WHITE);
-          canvas.drawString("Reset in corso...", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
-          canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-          
-          preferences.begin("epaper", false);
-          preferences.clear();
-          preferences.end();
-          
-          delay(1000);
-          canvas.fillCanvas(WHITE);
-          canvas.drawString("Fatto! Riavvio...", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
-          canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-          delay(1000);
-          ESP.restart();
-      }
-  }
-  
-  canvas.fillCanvas(WHITE);
-  canvas.drawString("Avvio...", M5EPD_PANEL_W / 2, M5EPD_PANEL_H / 2);
-  canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
- 
-  // Inizializza il filesystem SPIFFS per il font (se necessario)
+  // Inizializza il filesystem SPIFFS per il font e le immagini
   if (!SPIFFS.begin()) {
     Serial.println("SPIFFS Mount Failed");
     return;
@@ -2947,97 +2880,57 @@ std::vector<CalendarEvent> fetchTodayCalendarEvents() {
     HTTPClient http;
     WiFiClient client;
 
-    String apiUrl = homeAssistantAddress + "/api/services/calendar/get_events";
+    // Modifica: Usa l'API states per leggere direttamente l'entità
+    String apiUrl = homeAssistantAddress + "/api/states/" + calendarEntityId;
     http.begin(client, apiUrl);
     http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
 
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
-        Serial.println("Failed to obtain time for calendar events.");
-        hideBusyIndicator();
-        return events;
-    }
-
-    char start_time_buffer[30];
-    char end_time_buffer[30];
-    // Home Assistant expects ISO 8601 format. Using UTC for simplicity.
-    strftime(start_time_buffer, sizeof(start_time_buffer), "%Y-%m-%dT00:00:00Z", &timeinfo); // Start of today UTC
-    strftime(end_time_buffer, sizeof(end_time_buffer), "%Y-%m-%dT23:59:59Z", &timeinfo);   // End of today UTC
-
-    // Usa l'entità calendario configurabile
-    String calendarEntity = calendarEntityId;
-    String jsonPayload = "{\"entity_id\":\"" + calendarEntity + "\", \"start_date_time\":\"" + String(start_time_buffer) + "\", \"end_date_time\":\"" + String(end_time_buffer) + "\"}";
-
-    int httpResponseCode = http.POST(jsonPayload);
+    int httpResponseCode = http.GET(); // Usa GET invece di POST
     if (httpResponseCode == HTTP_CODE_OK) {
         String payload = http.getString();
-        Serial.println("Calendar Events Payload: " + payload);
+        Serial.println("Calendar State Payload: " + payload);
 
-        // Parsing manuale della risposta JSON
-        // Formato atteso: {"calendar.famiglia": {"events": [{"summary": "...", "start": "...", "end": "..."}, ...]}}
-        // Trova l'array associato all'entità calendario
-        int calendarEntityKeyStart = payload.indexOf("\"" + calendarEntity + "\":");
-        if (calendarEntityKeyStart != -1) {
-            int arrayStart = payload.indexOf("[", calendarEntityKeyStart);
-            int arrayEnd = payload.indexOf("]", arrayStart);
-            if (arrayStart != -1 && arrayEnd != -1) {
-                String eventsArrayStr = payload.substring(arrayStart + 1, arrayEnd);
-                int currentPos = 0;
-                while (currentPos < eventsArrayStr.length()) {
-                    int objStart = eventsArrayStr.indexOf("{", currentPos);
-                    if (objStart == -1) break;
-                    int objEnd = eventsArrayStr.indexOf("}", objStart);
-                    if (objEnd == -1) break;
+        // Parsing manuale della risposta JSON per l'attributo message
+        // Cerca "attributes"
+        int attrStart = payload.indexOf("\"attributes\":{");
+        if (attrStart != -1) {
+            CalendarEvent newEvent;
+            
+            // Cerca message (titolo)
+            int msgKey = payload.indexOf("\"message\":\"", attrStart);
+            if (msgKey != -1) {
+                int valStart = msgKey + 11;
+                int valEnd = payload.indexOf("\"", valStart);
+                if (valEnd != -1) newEvent.summary = payload.substring(valStart, valEnd);
+            }
 
-                    String eventObjStr = eventsArrayStr.substring(objStart, objEnd + 1);
-                    CalendarEvent newEvent;
+            // Cerca start_time
+            int startKey = payload.indexOf("\"start_time\":\"", attrStart);
+            if (startKey != -1) {
+                int valStart = startKey + 14;
+                int valEnd = payload.indexOf("\"", valStart);
+                if (valEnd != -1) newEvent.startTime = payload.substring(valStart, valEnd);
+            }
 
-                    // Estrai summary
-                    int summaryKey = eventObjStr.indexOf("\"summary\":\"");
-                    if (summaryKey != -1) {
-                        int valStart = summaryKey + 11;
-                        int valEnd = eventObjStr.indexOf("\"", valStart);
-                        if (valEnd != -1) newEvent.summary = eventObjStr.substring(valStart, valEnd);
-                    }
-                    // Estrai start
-                    int startKey = eventObjStr.indexOf("\"start\":\"");
-                    if (startKey != -1) {
-                        int valStart = startKey + 9;
-                        int valEnd = eventObjStr.indexOf("\"", valStart);
-                        if (valEnd != -1) newEvent.startTime = eventObjStr.substring(valStart, valEnd);
-                    }
-                    // Estrai end
-                    int endKey = eventObjStr.indexOf("\"end\":\"");
-                    if (endKey != -1) {
-                        int valStart = endKey + 7;
-                        int valEnd = eventObjStr.indexOf("\"", valStart);
-                        if (valEnd != -1) newEvent.endTime = eventObjStr.substring(valStart, valEnd);
-                    }
+            // Cerca end_time
+            int endKey = payload.indexOf("\"end_time\":\"", attrStart);
+            if (endKey != -1) {
+                int valStart = endKey + 12;
+                int valEnd = payload.indexOf("\"", valStart);
+                if (valEnd != -1) newEvent.endTime = payload.substring(valStart, valEnd);
+            }
+            
+            // Mappa message (titolo) su newEvent.message per visualizzarlo
+            newEvent.message = newEvent.summary;
 
-                    // Estrai description (che l'utente chiama message)
-                    int descKey = eventObjStr.indexOf("\"description\":\"");
-                    if (descKey != -1) {
-                        int valStart = descKey + 15;
-                        int valEnd = eventObjStr.indexOf("\"", valStart);
-                        if (valEnd != -1) {
-                            String desc = eventObjStr.substring(valStart, valEnd);
-                            // Sostituisci \\n con un vero a capo se necessario, anche se per ora non lo gestiamo nel draw
-                            desc.replace("\\\\n", "\n");
-                            newEvent.message = desc;
-                        }
-                    }
-
-                    events.push_back(newEvent);
-                    currentPos = objEnd + 1;
-                    if (eventsArrayStr.indexOf(",", currentPos) == currentPos) { // Salta la virgola se presente
-                        currentPos++;
-                    }
-                }
+            // Se abbiamo trovato almeno il titolo o l'orario, aggiungiamo l'evento
+            if (newEvent.summary != "" || newEvent.startTime != "") {
+                 events.push_back(newEvent);
             }
         }
     } else {
-        Serial.printf("[HTTP] Calendar events fetch failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
+        Serial.printf("[HTTP] Calendar state fetch failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
     }
     http.end();
     hideBusyIndicator();
