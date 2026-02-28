@@ -25,6 +25,21 @@ String ssid = "";
 String password = ""; 
 String calendarEntityId = "calendar.famiglia"; // Entità calendario configurabile
 String defaultMediaEntityId = ""; // Media player predefinito
+String logEntityId = ""; // Entità per il log
+// Aggiunta per OpenWeatherMap
+String openWeatherMapApiToken = "";
+String openWeatherMapCity = "";
+String weatherIcon = "";
+String weatherTemp = "";
+String weatherDescription = "";
+
+struct WeatherForecast {
+    String time;
+    float temp;
+    String icon;
+    float pop;
+};
+std::vector<WeatherForecast> weatherForecasts;
 
 // --- IMPOSTAZIONI MQTT ---
 String mqtt_server = ""; 
@@ -108,6 +123,7 @@ const int CLOCK_PAGE = 6;         // Pagina orologio analogico
 const int CALENDAR_PAGE = 7;      // Pagina calendario
 const int SCRIPT_PAGE = 8;        // Pagina script
 const int MEDIA_CONTROL_PAGE = 9; // Pagina controllo media
+const int LOG_PAGE = 12;          // Pagina log
 // --- STATO CONTROLLO LUCE ---
 const int LIGHT_CONTROL_PAGE = 5;
 String selectedLightEntity = "";
@@ -137,6 +153,8 @@ int calendarMonthOffset = 0;
 // --- STATO UI ---
 bool isDarkMode = false;
 int headerBatteryX = 0;
+String lastLogState = "";
+unsigned long lastLogCheckTime = 0;
 
 int currentPage = 0; // 0 = SENSORI, 1 = HOME
 const int GRAPH_PAGE = 4; // Pagina grafico
@@ -167,6 +185,7 @@ void drawAppointmentsPage();
 void drawWeekView();
 void fetchMediaDetails(String entity_id);
 void setMediaVolume(String entity_id, float volume);
+void drawLogPage(bool partialUpdate = false);
 void controlMediaPlayer(String entity_id, String action);
 void drawHotspotControl(); // Sostituisce drawCalendar
 void drawAnalogClock();
@@ -179,6 +198,14 @@ void handleSetPage();
 void handleDeepSleep();
 String encryptConfig(String input);
 String decryptConfig(String input);
+// Funzioni per il meteo
+void fetchWeatherData();
+void fetchWeatherForecast();
+void drawWeatherInfo(int x, int y, int w);
+void drawWeatherGraph(int x, int y, int w, int h);
+void drawWeatherIcon(String icon, int x, int y, int size);
+String fetchCurrentState(String entity_id);
+
 
 // Funzione helper per trovare lo stato di un sensore tramite il suo entity_id
 String getSensorState(String entity_id) {
@@ -1557,6 +1584,8 @@ void handleWifiConfig() {
     html += "<input type='text' name='calendar_entity' value='" + calendarEntityId + "'><br>";
     html += "<label>Entit&agrave; Media Player Predefinita:</label><br>";
     html += "<input type='text' name='media_entity' value='" + defaultMediaEntityId + "'><br>";
+    html += "<label>Entit&agrave; Log (es. sensor.porta):</label><br>";
+    html += "<input type='text' name='log_entity' value='" + logEntityId + "'><br>";
     
     html += "<h3>MQTT</h3>";
     html += "<label>Server:</label><br>";
@@ -1567,6 +1596,12 @@ void handleWifiConfig() {
     html += "<input type='text' name='mqtt_user' value='" + mqtt_user + "'><br>";
     html += "<label>Password:</label><br>";
     html += "<input type='password' name='mqtt_password' value='" + mqtt_password + "'><br>";
+
+    html += "<h3>OpenWeatherMap</h3>";
+    html += "<label>API Token:</label><br>";
+    html += "<input type='text' name='owm_token' value='" + openWeatherMapApiToken + "'><br>";
+    html += "<label>Citt&agrave;:</label><br>";
+    html += "<input type='text' name='owm_city' value='" + openWeatherMapCity + "'><br>";
 
     html += "<h3>Risparmio Energetico</h3>";
     html += "<label>Deep Sleep:</label><br>";
@@ -1601,11 +1636,16 @@ void handleSaveWifi() {
         
         if (server.hasArg("calendar_entity")) preferences.putString("calendarEntity", encryptConfig(server.arg("calendar_entity")));
         if (server.hasArg("media_entity")) preferences.putString("mediaEntity", encryptConfig(server.arg("media_entity")));
+  if (server.hasArg("log_entity")) preferences.putString("logEntity", encryptConfig(server.arg("log_entity")));
 
         if (server.hasArg("mqtt_server")) preferences.putString("mqtt_server", encryptConfig(server.arg("mqtt_server")));
         if (server.hasArg("mqtt_port")) preferences.putInt("mqtt_port", server.arg("mqtt_port").toInt());
         if (server.hasArg("mqtt_user")) preferences.putString("mqtt_user", encryptConfig(server.arg("mqtt_user")));
         if (server.hasArg("mqtt_password")) preferences.putString("mqtt_password", encryptConfig(server.arg("mqtt_password")));
+
+        // Salva configurazione OpenWeatherMap
+        if (server.hasArg("owm_token")) preferences.putString("owm_token", encryptConfig(server.arg("owm_token")));
+        if (server.hasArg("owm_city")) preferences.putString("owm_city", encryptConfig(server.arg("owm_city")));
         
         if (server.hasArg("ds_enabled")) preferences.putBool("ds_enabled", server.arg("ds_enabled").toInt());
         if (server.hasArg("ds_timeout")) preferences.putULong("ds_timeout", server.arg("ds_timeout").toInt());
@@ -1725,6 +1765,10 @@ void setup() {
 
   calendarEntityId = decryptConfig(preferences.getString("calendarEntity", calendarEntityId));
   defaultMediaEntityId = decryptConfig(preferences.getString("mediaEntity", defaultMediaEntityId));
+  logEntityId = decryptConfig(preferences.getString("logEntity", logEntityId));
+  // Carica configurazione OpenWeatherMap
+  openWeatherMapApiToken = decryptConfig(preferences.getString("owm_token", ""));
+  openWeatherMapCity = decryptConfig(preferences.getString("owm_city", ""));
 
   preferences.end();
 
@@ -1812,7 +1856,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println("Message arrived on topic: " + topicStr);
 
   // Se arriva un messaggio sul topic di aggiornamento, ridisegna tutto (tranne pagine speciali).
-  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE) {
+  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE && currentPage != LOG_PAGE) {
     Serial.println("Update command received via MQTT. Refreshing screen...");
     // CORREZIONE: Esegui un aggiornamento parziale invece di un refresh completo.
     updateStates(true, true); // Ottieni i nuovi stati
@@ -1939,6 +1983,7 @@ void drawFullUI(bool syncPage) {
   else if (currentPage == CLOCK_PAGE) drawAnalogClock(); // Existing logic
   else if (currentPage == APPOINTMENTS_PAGE) drawAppointmentsPage(); // New logic for appointments
   else if (currentPage == WEEK_VIEW_PAGE) drawWeekView();
+  else if (currentPage == LOG_PAGE) drawLogPage();
   else {
       if (currentPage == 1) {
           gridButtons[0].entity_id = "";
@@ -1954,7 +1999,15 @@ void drawFullUI(bool syncPage) {
            gridButtons[2].name = "Media";
            gridButtons[2].type = "media_page_link";
            gridButtons[2].state = "off";
-           for (int k = 3; k < NUM_GRID_BUTTONS; k++) {
+           gridButtons[3].entity_id = "";
+           gridButtons[3].name = "Log";
+           gridButtons[3].type = "log_page_link";
+           gridButtons[3].state = "off";
+           gridButtons[3].entity_id = "";
+           gridButtons[3].name = "Log";
+           gridButtons[3].type = "log_page_link";
+           gridButtons[3].state = "off";
+           for (int k = 4; k < NUM_GRID_BUTTONS; k++) {
                gridButtons[k].name = "";
            }
       }
@@ -2221,6 +2274,269 @@ void drawGraph(String entity_id, String name, int hours) {
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
 }
 
+void fetchWeatherData() {
+    if (openWeatherMapApiToken == "" || openWeatherMapCity == "" || WiFi.status() != WL_CONNECTED) {
+        weatherDescription = "N/A";
+        weatherTemp = "";
+        weatherIcon = "";
+        return;
+    }
+
+    HTTPClient http;
+    WiFiClient client;
+    String url = "http://api.openweathermap.org/data/2.5/weather?q=" + openWeatherMapCity + "&appid=" + openWeatherMapApiToken + "&units=metric&lang=it";
+    
+    Serial.println("Fetching weather data from: " + url);
+    http.begin(client, url);
+    
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        Serial.println("Weather Payload: " + payload);
+
+        // --- Parsing JSON manualmente ---
+        // Estrai temperatura da {"main":{"temp":...}}
+        int mainIndex = payload.indexOf("\"main\":{");
+        if (mainIndex != -1) {
+            int tempIndex = payload.indexOf("\"temp\":", mainIndex);
+            if (tempIndex != -1) {
+                int tempValueStart = tempIndex + 7;
+                int tempValueEnd = payload.indexOf(",", tempValueStart);
+                weatherTemp = payload.substring(tempValueStart, tempValueEnd);
+                // Arrotonda
+                int dotIndex = weatherTemp.indexOf('.');
+                if (dotIndex != -1) {
+                    weatherTemp = weatherTemp.substring(0, dotIndex);
+                }
+            }
+        }
+
+        // Estrai descrizione e icona da {"weather":[{"description":"...","icon":"..."}]}
+        int weatherIndex = payload.indexOf("\"weather\":[{");
+        if (weatherIndex != -1) {
+            int descIndex = payload.indexOf("\"description\":\"", weatherIndex);
+            if (descIndex != -1) {
+                int descValueStart = descIndex + 15;
+                int descValueEnd = payload.indexOf("\"", descValueStart);
+                weatherDescription = payload.substring(descValueStart, descValueEnd);
+                weatherDescription.toUpperCase();
+            }
+            int iconIndex = payload.indexOf("\"icon\":\"", weatherIndex);
+            if (iconIndex != -1) {
+                int iconValueStart = iconIndex + 8;
+                int iconValueEnd = payload.indexOf("\"", iconValueStart);
+                weatherIcon = payload.substring(iconValueStart, iconValueEnd);
+            }
+        }
+
+        Serial.println("Weather: " + weatherDescription + ", " + weatherTemp + "C, icon: " + weatherIcon);
+    } else {
+        Serial.printf("[HTTP] Weather fetch failed, error: %s\n", http.errorToString(httpCode).c_str());
+        weatherDescription = "Errore Meteo";
+        weatherTemp = "";
+        weatherIcon = "";
+    }
+    http.end();
+}
+
+void fetchWeatherForecast() {
+    if (openWeatherMapApiToken == "" || openWeatherMapCity == "" || WiFi.status() != WL_CONNECTED) return;
+    
+    HTTPClient http;
+    WiFiClient client;
+    // Richiedi previsioni (cnt=5 per circa 15 ore, step di 3 ore)
+    String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + openWeatherMapCity + "&appid=" + openWeatherMapApiToken + "&units=metric&lang=it&cnt=5";
+    
+    Serial.println("Fetching weather forecast from: " + url);
+    http.begin(client, url);
+    
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        weatherForecasts.clear();
+        
+        int index = 0;
+        for (int i = 0; i < 5; i++) {
+            // Trova timestamp
+            int dtIdx = payload.indexOf("\"dt\":", index);
+            if (dtIdx == -1) break;
+            
+            int dtValStart = dtIdx + 5;
+            int dtValEnd = payload.indexOf(",", dtValStart);
+            String dtStr = payload.substring(dtValStart, dtValEnd);
+            time_t dt = dtStr.toInt();
+            struct tm* timeinfo = localtime(&dt);
+            char timeBuf[6];
+            strftime(timeBuf, 6, "%H:%M", timeinfo);
+            
+            // Trova Temperatura
+            int tempIdx = payload.indexOf("\"temp\":", dtIdx);
+            float temp = 0;
+            if (tempIdx != -1) {
+                int tStart = tempIdx + 7;
+                int tEnd = payload.indexOf(",", tStart);
+                temp = payload.substring(tStart, tEnd).toFloat();
+            }
+            
+            // Trova Icona
+            int iconIdx = payload.indexOf("\"icon\":\"", dtIdx);
+            String icon = "";
+            if (iconIdx != -1) {
+                int iStart = iconIdx + 8;
+                int iEnd = payload.indexOf("\"", iStart);
+                icon = payload.substring(iStart, iEnd);
+            }
+            
+            // Trova Probabilità di Pioggia (POP)
+            int popIdx = payload.indexOf("\"pop\":", dtIdx);
+            float pop = 0.0;
+            if (popIdx != -1) {
+                // Verifica che sia prima del prossimo blocco
+                int nextDt = payload.indexOf("\"dt\":", dtIdx + 1);
+                if (nextDt == -1 || popIdx < nextDt) {
+                    int pStart = popIdx + 6;
+                    int pEnd = payload.indexOf(",", pStart);
+                    int pEndBrace = payload.indexOf("}", pStart);
+                    if (pEnd == -1 || (pEndBrace != -1 && pEndBrace < pEnd)) pEnd = pEndBrace;
+                    if (pEnd != -1) pop = payload.substring(pStart, pEnd).toFloat();
+                }
+            }
+            
+            weatherForecasts.push_back({String(timeBuf), temp, icon, pop});
+            index = iconIdx + 1;
+        }
+        Serial.printf("Fetched %d forecast points\n", weatherForecasts.size());
+    }
+    http.end();
+}
+
+void drawWeatherGraph(int x, int y, int w, int h) {
+    if (weatherForecasts.empty()) return;
+    if (y + h > M5EPD_PANEL_H) return;
+
+    // Trova min/max per scalare il grafico
+    float minT = weatherForecasts[0].temp;
+    float maxT = weatherForecasts[0].temp;
+    for (const auto& f : weatherForecasts) {
+        if (f.temp < minT) minT = f.temp;
+        if (f.temp > maxT) maxT = f.temp;
+    }
+    minT -= 1.0; // Margine
+    maxT += 1.0;
+    float range = maxT - minT;
+    if (range < 2.0) range = 2.0;
+
+    int numPoints = weatherForecasts.size();
+    int stepX = w / numPoints;
+    int startX = x + stepX / 2;
+
+    canvas.setFreeFont(&FreeSans9pt7b);
+    canvas.setTextDatum(TC_DATUM);
+    
+    int graphY = y + 40; // Spazio per icone sopra
+    int graphH = h - 80; // Spazio per orari e pop sotto
+
+    for (int i = 0; i < numPoints; i++) {
+        int px = startX + i * stepX;
+        
+        // Disegna Icona
+        drawWeatherIcon(weatherForecasts[i].icon, px, y + 20, 30);
+        
+        // Calcola Y del punto
+        int py = graphY + graphH - (int)((weatherForecasts[i].temp - minT) / range * graphH);
+        
+        // Disegna linea verso il prossimo punto
+        if (i < numPoints - 1) {
+            int nextPx = startX + (i + 1) * stepX;
+            int nextPy = graphY + graphH - (int)((weatherForecasts[i+1].temp - minT) / range * graphH);
+            canvas.drawLine(px, py, nextPx, nextPy, 3, BLACK);
+        }
+        
+        // Disegna punto e etichetta temperatura
+        canvas.fillCircle(px, py, 4, BLACK);
+        canvas.drawString(String((int)round(weatherForecasts[i].temp)) + "°", px, py - 20);
+        
+        // Disegna Probabilità Pioggia se significativa (>0)
+        if (weatherForecasts[i].pop > 0.0) {
+            int popPct = (int)(weatherForecasts[i].pop * 100);
+            canvas.setFreeFont(&FreeSans9pt7b);
+            canvas.drawString(String(popPct) + "%", px, y + h - 38);
+        }
+        
+        // Disegna Orario
+        canvas.drawString(weatherForecasts[i].time, px, y + h - 20);
+    }
+}
+
+void drawWeatherIcon(String icon, int x, int y, int size) {
+    // Simple icon mapping
+    if (icon.startsWith("01")) { // clear sky
+        canvas.fillCircle(x, y, size / 2, BLACK);
+        canvas.fillCircle(x, y, size / 2 - 4, WHITE);
+    } else if (icon.startsWith("02")) { // few clouds
+        canvas.fillCircle(x + size/4, y - size/8, size / 3, BLACK);
+        canvas.fillCircle(x - size/4, y + size/8, size / 3, BLACK);
+        canvas.fillCircle(x, y, size / 2, WHITE);
+        canvas.drawCircle(x, y, size / 2, BLACK);
+    } else if (icon.startsWith("03") || icon.startsWith("04")) { // scattered/broken clouds
+        canvas.fillCircle(x + size/4, y - size/8, size / 3, BLACK);
+        canvas.fillCircle(x - size/4, y + size/8, size / 3, BLACK);
+        canvas.fillRect(x - size/3, y, size*2/3, size/3, BLACK);
+    } else if (icon.startsWith("09") || icon.startsWith("10")) { // shower rain/rain
+        canvas.fillCircle(x + size/4, y - size/4, size / 3, BLACK);
+        canvas.fillCircle(x - size/4, y - size/8, size / 3, BLACK);
+        canvas.fillRect(x - size/3, y - size/4, size*2/3, size/3, BLACK);
+        canvas.drawLine(x - size/4, y, x - size/8, y + size/2, 2, BLACK);
+        canvas.drawLine(x + size/8, y, x + size/4, y + size/2, 2, BLACK);
+    } else if (icon.startsWith("11")) { // thunderstorm
+        canvas.fillCircle(x + size/4, y - size/4, size / 3, BLACK);
+        canvas.fillCircle(x - size/4, y - size/8, size / 3, BLACK);
+        canvas.fillRect(x - size/3, y - size/4, size*2/3, size/3, BLACK);
+        canvas.fillTriangle(x, y, x - size/4, y + size/2, x + size/4, y + size/2, BLACK);
+    } else if (icon.startsWith("13")) { // snow
+        canvas.fillCircle(x + size/4, y - size/4, size / 3, BLACK);
+        canvas.fillCircle(x - size/4, y - size/8, size / 3, BLACK);
+        canvas.fillRect(x - size/3, y - size/4, size*2/3, size/3, BLACK);
+        canvas.drawCircle(x, y + size/4, 3, BLACK);
+        canvas.drawCircle(x - size/3, y + size/3, 3, BLACK);
+        canvas.drawCircle(x + size/3, y + size/3, 3, BLACK);
+    } else { // default
+        canvas.drawRect(x - size/2, y - size/2, size, size, BLACK);
+        canvas.drawString("?", x, y);
+    }
+}
+
+void drawWeatherInfo(int x, int y, int w) {
+    // Non disegnare se non c'è abbastanza spazio verticale
+    if (y > M5EPD_PANEL_H - 100) {
+        return;
+    }
+
+    y += 20; // Spazio dopo gli appuntamenti o il messaggio
+    canvas.fillRect(x, y, w, 2, BLACK); // Linea di separazione
+    y += 10; // Spazio dopo la linea
+
+    int icon_x = x + 40;
+    int icon_y = y + 40;
+    if (weatherIcon != "") {
+        drawWeatherIcon(weatherIcon, icon_x, icon_y, 60);
+    }
+
+    int text_x = x + 90; // Posizione X per i testi a destra dell'icona
+
+    // Disegna la temperatura (grande, in alto)
+    canvas.setFreeFont(&FreeSansBold24pt7b);
+    canvas.setTextDatum(TL_DATUM);
+    if (weatherTemp != "") {
+        canvas.drawString(weatherTemp + "°C", text_x, y + 5);
+    }
+
+    // Disegna la descrizione (piccola, in basso)
+    canvas.setFreeFont(&FreeSans12pt7b);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawString(weatherDescription, text_x, y + 45);
+}
+
 void drawAppointmentsPage() {
     const int header_height = 80;
     const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
@@ -2236,15 +2552,20 @@ void drawAppointmentsPage() {
     canvas.setTextDatum(TC_DATUM);
     canvas.drawString("Appuntamenti di Oggi", col2_start_x + col2_width / 2, header_height + 30);
 
-    todayEvents = fetchTodayCalendarEvents();
+    fetchWeatherData(); // Carica i dati meteo
+    fetchWeatherForecast(); // Carica previsioni
+    todayEvents = fetchTodayCalendarEvents(); 
+
+    int y_pos = header_height + 80;
 
     if (todayEvents.empty()) {
         canvas.setFreeFont(&FreeSans12pt7b);
-        canvas.drawString("Nessun appuntamento per oggi.", col2_start_x + col2_width / 2, header_height + 100);
+        canvas.setTextDatum(TC_DATUM);
+        canvas.drawString("Nessun appuntamento per oggi.", col2_start_x + col2_width / 2, y_pos + 20);
+        y_pos += 50; // Sposta la Y verso il basso per posizionare il meteo correttamente
     } else {
         canvas.setFreeFont(&FreeSans12pt7b);
         canvas.setTextDatum(TL_DATUM);
-        int y_pos = header_height + 80;
         for (const auto& event : todayEvents) {
             // Formatta l'ora (es. "09:00 - 10:00")
             String startTimeFormatted = event.startTime.substring(11, 16); // Estrai HH:MM
@@ -2261,6 +2582,10 @@ void drawAppointmentsPage() {
             int current_x = col2_start_x + 20;
 
             String remainingText = eventText;
+            // Controlla se c'è abbastanza spazio per almeno una riga E per il meteo (aumentato spazio richiesto)
+            if (y_pos > M5EPD_PANEL_H - 250) { 
+                break;
+            }
             while (remainingText.length() > 0) {
                 String line = "";
                 int lastSpace = -1;
@@ -2276,18 +2601,159 @@ void drawAppointmentsPage() {
                         }
                         break;
                     }
-                    if (remainingText.charAt(i) == ' ') lastSpace = i;
+                    if (remainingText.charAt(i) == ' ') {
+                        lastSpace = i;
+                    }
                     line = testLine;
-                    if (i == remainingText.length() - 1) remainingText = ""; // Ultima parte del testo
+                    if (i == remainingText.length() - 1) {
+                        remainingText = ""; // Ultima parte del testo
+                    }
                 }
                 canvas.drawString(line, current_x, y_pos);
                 y_pos += 20; // Altezza riga
-                if (y_pos > M5EPD_PANEL_H - 20) break; // Evita di disegnare fuori schermo
+                if (y_pos > M5EPD_PANEL_H - 250) { // Controlla di nuovo dentro il loop
+                    break;
+                }
             }
             y_pos += 10; // Spazio extra tra gli eventi
+            if (y_pos > M5EPD_PANEL_H - 250) { // E anche qui
+                break;
+            }
         }
     }
+    // Disegna le informazioni meteo dinamicamente sotto gli appuntamenti
+    drawWeatherInfo(col2_start_x, y_pos, col2_width);
+    
+    // Disegna il grafico sotto le info meteo
+    y_pos += 80; // Altezza stimata sezione info meteo
+    drawWeatherGraph(col2_start_x, y_pos, col2_width, 140);
+    
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+}
+
+void drawLogPage(bool partialUpdate) {
+    const int header_height = 80;
+    const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
+    const int col2_width = M5EPD_PANEL_W - col2_start_x;
+    const int area_h = M5EPD_PANEL_H - header_height;
+
+    // Pulisci area
+    canvas.fillRect(col2_start_x, header_height, col2_width, area_h, WHITE);
+
+    // Titolo
+    canvas.setFreeFont(&FreeSansBold18pt7b);
+    canvas.setTextColor(BLACK);
+    canvas.setTextDatum(TC_DATUM);
+    canvas.drawString("Log: " + logEntityId, col2_start_x + col2_width / 2, header_height + 30);
+
+    if (logEntityId == "") {
+        canvas.setFreeFont(&FreeSans12pt7b);
+        canvas.drawString("Nessuna entita' configurata", col2_start_x + col2_width / 2, header_height + 150);
+        canvas.pushCanvas(0, 0, partialUpdate ? UPDATE_MODE_DU : UPDATE_MODE_GC16);
+        return;
+    }
+
+    if (!partialUpdate) showBusyIndicator();
+    
+    // Fetch Log Data
+    std::vector<String> logs;
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        WiFiClient client;
+        
+        // Get history for last 24 hours
+        time_t now;
+        time(&now);
+        time_t start = now - (24 * 3600);
+        struct tm * timeinfo;
+        timeinfo = gmtime(&start);
+        char buffer[30];
+        strftime(buffer, 30, "%Y-%m-%dT%H:%M:%S", timeinfo);
+        String timestamp = String(buffer) + "Z";
+
+        String url = homeAssistantAddress + "/api/history/period/" + timestamp + "?filter_entity_id=" + logEntityId;
+        http.begin(client, url);
+        http.addHeader("Authorization", "Bearer " + homeAssistantToken);
+        http.addHeader("Content-Type", "application/json");
+        
+        int httpCode = http.GET();
+        if (httpCode == HTTP_CODE_OK) {
+            WiFiClient *stream = http.getStreamPtr();
+            while (stream->available()) {
+                if (stream->find("\"state\"")) {
+                    if (stream->find("\"")) {
+                        String state = stream->readStringUntil('\"');
+                        if (stream->find("\"last_changed\"")) {
+                            if (stream->find("\"")) {
+                                String last_changed = stream->readStringUntil('\"');
+                                // Parse timestamp (HH:MM)
+                                String timeStr = last_changed.substring(11, 16);
+                                logs.push_back(timeStr + ": " + state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        http.end();
+    }
+    if (!partialUpdate) hideBusyIndicator();
+
+    // Draw Logs (Last 15 entries)
+    canvas.setFreeFont(&FreeSans12pt7b);
+    canvas.setTextDatum(TL_DATUM);
+    int y = header_height + 80;
+    
+    // Calcola dinamicamente il numero massimo di righe in base all'altezza dello schermo
+    int lineHeight = 30;
+    int bottomMargin = 20;
+    int maxLines = (M5EPD_PANEL_H - y - bottomMargin) / lineHeight;
+    if (maxLines < 1) maxLines = 1;
+
+    int startIdx = (logs.size() > maxLines) ? logs.size() - maxLines : 0;
+    
+    if (logs.empty()) {
+        canvas.setTextDatum(TC_DATUM);
+        canvas.drawString("Nessun dato trovato", col2_start_x + col2_width / 2, y);
+    } else {
+        // Aggiorna l'ultimo stato noto per il controllo nel loop
+        String lastEntry = logs.back();
+        int sep = lastEntry.indexOf(": ");
+        if (sep != -1) {
+            lastLogState = lastEntry.substring(sep + 2);
+        }
+
+        // Disegna dal più vecchio al più recente (che sarà in fondo)
+        for (int i = startIdx; i < logs.size(); i++) {
+            canvas.drawString(logs[i], col2_start_x + 20, y);
+            y += 30;
+        }
+    }
+    
+    canvas.pushCanvas(0, 0, partialUpdate ? UPDATE_MODE_DU : UPDATE_MODE_GC16);
+}
+
+String fetchCurrentState(String entity_id) {
+    if (homeAssistantAddress == "" || WiFi.status() != WL_CONNECTED) return "";
+    HTTPClient http;
+    WiFiClient client;
+    String url = homeAssistantAddress + "/api/states/" + entity_id;
+    http.begin(client, url);
+    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.GET();
+    String state = "";
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        int stateIdx = payload.indexOf("\"state\"");
+        if (stateIdx != -1) {
+            int valStart = payload.indexOf("\"", stateIdx + 7) + 1;
+            int valEnd = payload.indexOf("\"", valStart);
+            state = payload.substring(valStart, valEnd);
+        }
+    }
+    http.end();
+    return state;
 }
 
 void loop() {
@@ -2300,7 +2766,7 @@ void loop() {
   if (millis() - lastUpdate > UPDATE_INTERVAL) {
       lastUpdate = millis();
       // Non aggiornare se siamo in pagine speciali (controllo, grafico, musica, ecc.)
-      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE) {
+      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE && currentPage != LOG_PAGE) {
           // Se updateStates ritorna true, significa che la pagina è cambiata
           bool pageChanged = updateStates(true, true);
           if (pageChanged) {
@@ -2335,11 +2801,22 @@ void loop() {
           drawHeader();
           drawAnalogClock();
           canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-      } else if (currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE) {
+      } else if (currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != LOG_PAGE) {
           M5EPD_Canvas headerCanvas(&M5.EPD);
           headerCanvas.createCanvas(M5EPD_PANEL_W, 80);
           drawHeader(&headerCanvas);
           headerCanvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+      }
+  }
+
+  // Controllo rapido aggiornamenti per pagina LOG (ogni 1 secondo)
+  if (currentPage == LOG_PAGE) {
+      if (millis() - lastLogCheckTime > 1000) {
+          lastLogCheckTime = millis();
+          String currentState = fetchCurrentState(logEntityId);
+          if (currentState != "" && currentState != lastLogState) {
+              drawLogPage(true); // Aggiorna se lo stato è cambiato
+          }
       }
   }
 
@@ -2521,8 +2998,18 @@ void loop() {
               gridButtons[0].type = "hotspot";
               wifi_mode_t mode = WiFi.getMode();
               gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
+              gridButtons[1].entity_id = "";
               gridButtons[1].name = "Script";
               gridButtons[1].type = "script_page";
+              gridButtons[1].state = "off";
+              gridButtons[2].entity_id = "";
+              gridButtons[2].name = "Media";
+              gridButtons[2].type = "media_page_link";
+              gridButtons[2].state = "off";
+              gridButtons[3].entity_id = "";
+              gridButtons[3].name = "Log";
+              gridButtons[3].type = "log_page_link";
+              gridButtons[3].state = "off";
 
               drawHeader();
               drawButtons();
@@ -2614,6 +3101,11 @@ void loop() {
                }
                drawHeader();
                drawMediaControlPage();
+               break;
+          } else if (String(gridButtons[i].type) == "log_page_link") {
+               currentPage = LOG_PAGE;
+               drawHeader();
+               drawLogPage(false);
                break;
           } else if (String(gridButtons[i].type) != "sensor") {
             toggleDevice(gridButtons[i].entity_id, gridButtons[i].type);
