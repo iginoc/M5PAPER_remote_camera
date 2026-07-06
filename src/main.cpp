@@ -20,7 +20,6 @@
 
 // --- VARIABILI GLOBALI ---
 String homeAssistantAddress = ""; 
-String homeAssistantToken = "";     
 String ssid = ""; 
 String password = ""; 
 String calendarEntityId = "calendar.famiglia"; // Entità calendario configurabile
@@ -156,6 +155,29 @@ int headerBatteryX = 0;
 String lastLogState = "";
 unsigned long lastLogCheckTime = 0;
 
+// --- BUFFER MESSAGGI MQTT CHAT ---
+const int PEBBLE_MAX_MESSAGES = 20;
+const char* PEBBLE_TOPIC = "casa/sensor/pebble_chat";
+std::vector<String> pebbleMessages; // Buffer circolare dei messaggi
+
+// --- VALORI SENSORI MQTT ---
+struct MqttSensorValue {
+    const char* topic;
+    const char* label;
+    const char* unit;
+    String value;
+};
+MqttSensorValue mqttSensors[] = {
+    {"casa/sensor/potenza_totale",            "Potenza",      " W",  "--"},
+    {"casa/sensor/sensore_zigbee_temperatura","Temperatura",  " \u00b0C", "--"},
+};
+const int NUM_MQTT_SENSORS = 2;
+
+// --- BUFFER MESSAGGI MQTT CALENDARIO ---
+const char* CALENDAR_TOPIC = "tv/app/calendario";
+const int CALENDAR_MAX_MESSAGES = 20;
+std::vector<String> calendarMqttMessages;
+
 int currentPage = 0; // 0 = SENSORI, 1 = HOME
 const int GRAPH_PAGE = 4; // Pagina grafico
 M5EPD_Canvas canvas(&M5.EPD);
@@ -226,7 +248,6 @@ bool testHomeAssistantConnection() {
   Serial.println("Connecting to: " + apiUrl);
 
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   int httpResponseCode = http.GET();
 
   if (httpResponseCode > 0) {
@@ -254,7 +275,6 @@ void toggleDevice(String entity_id, String type) {
   }
   String apiUrl = homeAssistantAddress + "/api/services/" + String(type) + "/" + service_action;
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   http.addHeader("Content-Type", "application/json");
 
   String jsonPayload = "{\"entity_id\":\"" + entity_id + "\"}";
@@ -280,7 +300,6 @@ void setPageInputNumber(int pageValue) {
   HTTPClient http;
   String apiUrl = homeAssistantAddress + "/api/services/input_number/set_value";
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   http.addHeader("Content-Type", "application/json");
 
   String jsonPayload = "{\"entity_id\":\"input_number.epaper_pagina\",\"value\":" + String(pageValue) + "}";
@@ -331,7 +350,6 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
 
   String apiUrl = homeAssistantAddress + "/api/template";
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   http.addHeader("Content-Type", "application/json");
   bool pageChanged = false;
 
@@ -608,7 +626,7 @@ int getInternalBatteryPercentage() {
 void drawSensors() {
     // Imposta un font "bello" (FreeFont) per i sensori
     canvas.setFreeFont(&FreeSansBold12pt7b); 
-    canvas.setTextColor(BLACK); // Testo bianco su sfondo nero (per via dell'inversione)
+    canvas.setTextColor(BLACK);
  
     // Calcoliamo una posizione di partenza fissa sotto i pulsanti dell'header
     const int header_height = 80;
@@ -622,9 +640,40 @@ void drawSensors() {
 
     // Pulisci l'intera area destra
     canvas.fillRect(col2_start_x, header_height, col2_width, M5EPD_PANEL_H - header_height, WHITE);
-    canvas.drawRect(col2_start_x, header_height, col2_width, M5EPD_PANEL_H - header_height, WHITE); // Clean borders
+    canvas.drawRect(col2_start_x, header_height, col2_width, M5EPD_PANEL_H - header_height, WHITE);
 
-    // Filtra i sensori visualizzabili
+    // ---- Disegna i sensori MQTT fissi nelle prime NUM_MQTT_SENSORS celle ----
+    for (int i = 0; i < NUM_MQTT_SENSORS; i++) {
+        int row = i / cols;
+        int col = i % cols;
+        int x = col2_start_x + col * btn_w;
+        int y = start_y + row * btn_h;
+
+        canvas.fillRect(x, y, btn_w, btn_h, WHITE);
+        canvas.drawRect(x, y, btn_w, btn_h, BLACK);
+
+        String val = mqttSensors[i].value;
+        String unit = String(mqttSensors[i].unit);
+        String label = String(mqttSensors[i].label);
+
+        // Icona
+        int iconX = x + 20;
+        int iconY = y + btn_h / 2 - 10;
+        if (unit.indexOf("°C") != -1) drawTemperatureIcon(iconX + 15, iconY + 5);
+        else if (unit.indexOf("W") != -1) drawPowerIcon(iconX + 15, iconY);
+
+        // Valore grande a destra
+        canvas.setFreeFont(&FreeSansBold18pt7b);
+        canvas.setTextDatum(MR_DATUM);
+        canvas.drawString(val + unit, x + btn_w - 20, y + btn_h / 2 - 25);
+
+        // Etichetta piccola in basso
+        canvas.setFreeFont(&FreeSans12pt7b);
+        canvas.setTextDatum(ML_DATUM);
+        canvas.drawString(label, x + 10, y + btn_h / 2 + 15);
+    }
+
+    // ---- Filtra i sensori HA visualizzabili ----
     std::vector<int> displayableIndices;
     for (size_t i = 0; i < sensors.size(); i++) {
         if (sensors[i].entity_id != "sensor.time" && sensors[i].entity_id != "sensor.oggi" && sensors[i].entity_id != "input_number.epaper_pagina") {
@@ -632,24 +681,29 @@ void drawSensors() {
         }
     }
 
-    if (displayableIndices.empty()) {
+    if (displayableIndices.empty() && NUM_MQTT_SENSORS == 0) {
         canvas.setTextDatum(TL_DATUM);
         canvas.drawString("Nessun sensore trovato.", col2_start_x + 20, header_height + 50);
         return;
     }
 
-    // Calcola paginazione
-    int totalPages = (displayableIndices.size() + SENSORS_PER_PAGE - 1) / SENSORS_PER_PAGE;
+    // Calcola paginazione: le prime NUM_MQTT_SENSORS celle sono occupate dai sensori MQTT
+    const int mqttOffset = NUM_MQTT_SENSORS; // celle fisse già disegnate
+    int totalAvailCells = SENSORS_PER_PAGE - mqttOffset; // celle rimaste per sensori HA
+    if (totalAvailCells < 1) totalAvailCells = 0;
+    int totalPages = displayableIndices.empty() ? 1 : (displayableIndices.size() + totalAvailCells - 1) / totalAvailCells;
     if (sensorPage >= totalPages) sensorPage = totalPages - 1;
     if (sensorPage < 0) sensorPage = 0;
 
-    int startIdx = sensorPage * SENSORS_PER_PAGE;
-    int endIdx = min((int)displayableIndices.size(), startIdx + SENSORS_PER_PAGE);
+    int startIdx = sensorPage * totalAvailCells;
+    int endIdx = min((int)displayableIndices.size(), startIdx + totalAvailCells);
 
-    for (int i = 0; i < SENSORS_PER_PAGE; i++) {
+    for (int i = 0; i < totalAvailCells; i++) {
+        // Indice nella griglia: parte dopo le celle MQTT
+        int cellIdx = mqttOffset + i;
         int sensorIdx = startIdx + i;
-        int row = i / cols;
-        int col = i % cols;
+        int row = cellIdx / cols;
+        int col = cellIdx % cols;
         int x = col2_start_x + col * btn_w;
         int y = start_y + row * btn_h;
 
@@ -813,7 +867,6 @@ void loadGroupLights() {
   String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
 
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   http.addHeader("Content-Type", "application/json");
 
   int httpResponseCode = http.POST(jsonPayload);
@@ -867,7 +920,6 @@ void loadGroupSwitches() {
   String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
 
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   http.addHeader("Content-Type", "application/json");
 
   int httpResponseCode = http.POST(jsonPayload);
@@ -920,7 +972,6 @@ void loadGroupScripts() {
   String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
 
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   http.addHeader("Content-Type", "application/json");
 
   int httpResponseCode = http.POST(jsonPayload);
@@ -966,7 +1017,6 @@ void fetchLightDetails(String entity_id) {
     WiFiClient client;
     String url = homeAssistantAddress + "/api/states/" + entity_id;
     http.begin(client, url);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
@@ -998,7 +1048,6 @@ void setLightBrightness(String entity_id, int brightness) {
     HTTPClient http;
     String apiUrl = homeAssistantAddress + "/api/services/light/turn_on";
     http.begin(client, apiUrl);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
     String jsonPayload = "{\"entity_id\":\"" + entity_id + "\", \"brightness\":" + String(brightness) + "}";
     http.POST(jsonPayload);
@@ -1303,7 +1352,6 @@ void loadGroupSensors() {
   String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
 
   http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + homeAssistantToken);
   http.addHeader("Content-Type", "application/json");
 
   int httpResponseCode = http.POST(jsonPayload);
@@ -1578,14 +1626,6 @@ void handleWifiConfig() {
     html += "<h3>Home Assistant</h3>";
     html += "<label>Indirizzo:</label><br>";
     html += "<input type='text' name='ha_address' value='" + homeAssistantAddress + "'><br>";
-    html += "<label>Token:</label><br>";
-    html += "<input type='text' name='ha_token' value='" + homeAssistantToken + "'><br>";
-    html += "<label>Entit&agrave; Calendario:</label><br>";
-    html += "<input type='text' name='calendar_entity' value='" + calendarEntityId + "'><br>";
-    html += "<label>Entit&agrave; Media Player Predefinita:</label><br>";
-    html += "<input type='text' name='media_entity' value='" + defaultMediaEntityId + "'><br>";
-    html += "<label>Entit&agrave; Log (es. sensor.porta):</label><br>";
-    html += "<input type='text' name='log_entity' value='" + logEntityId + "'><br>";
     
     html += "<h3>MQTT</h3>";
     html += "<label>Server:</label><br>";
@@ -1626,13 +1666,11 @@ void handleSaveWifi() {
         String new_ssid = server.arg("ssid");
         String new_pass = server.arg("password");
         String new_ha_address = server.arg("ha_address");
-        String new_ha_token = server.arg("ha_token");
         
         preferences.begin("epaper", false);
         preferences.putString("ssid", encryptConfig(new_ssid));
         preferences.putString("password", encryptConfig(new_pass));
         if (new_ha_address.length() > 0) preferences.putString("ha_address", encryptConfig(new_ha_address));
-        if (new_ha_token.length() > 0) preferences.putString("ha_token", encryptConfig(new_ha_token));
         
         if (server.hasArg("calendar_entity")) preferences.putString("calendarEntity", encryptConfig(server.arg("calendar_entity")));
         if (server.hasArg("media_entity")) preferences.putString("mediaEntity", encryptConfig(server.arg("media_entity")));
@@ -1734,7 +1772,7 @@ void setup() {
   Serial.begin(115200);
 
   // Inizializza il filesystem SPIFFS per il font e le immagini
-  if (!SPIFFS.begin()) {
+  if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS Mount Failed");
     return;
   }
@@ -1749,9 +1787,6 @@ void setup() {
   
   String savedHaAddress = decryptConfig(preferences.getString("ha_address", ""));
   if (savedHaAddress != "") homeAssistantAddress = savedHaAddress;
-  
-  String savedHaToken = decryptConfig(preferences.getString("ha_token", ""));
-  if (savedHaToken != "") homeAssistantToken = savedHaToken;
   
   mqtt_server = decryptConfig(preferences.getString("mqtt_server", mqtt_server));
   mqtt_port = preferences.getInt("mqtt_port", mqtt_port);
@@ -1873,8 +1908,55 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     canvas.pushCanvas(0, 0, UPDATE_MODE_DU); // Applica le modifiche con un refresh veloce
     lastActivityTime = millis(); // Resetta il timer di sonno
+  } else if (topicStr == String(PEBBLE_TOPIC)) {
+    // Aggiungi il messaggio al buffer
+    String msg = "";
+    for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+    
+    // Prepend ora locale
+    struct tm ti;
+    if (getLocalTime(&ti)) {
+      char timeBuf[7];
+      strftime(timeBuf, sizeof(timeBuf), "%H:%M ", &ti);
+      msg = String(timeBuf) + msg;
+    }
+    
+    pebbleMessages.push_back(msg);
+    if (pebbleMessages.size() > PEBBLE_MAX_MESSAGES)
+      pebbleMessages.erase(pebbleMessages.begin());
+    
+    // Se siamo sulla pagina LOG, aggiorna lo schermo subito
+    if (currentPage == LOG_PAGE) {
+      drawLogPage(true);
+    }
   } else {
-    // Qui puoi gestire altri topic se necessario in futuro
+    // Controlla i topic sensori MQTT
+    bool handled = false;
+    for (int i = 0; i < NUM_MQTT_SENSORS; i++) {
+        if (topicStr == String(mqttSensors[i].topic)) {
+            String val = "";
+            for (unsigned int j = 0; j < length; j++) val += (char)payload[j];
+            int dot = val.indexOf('.');
+            if (dot != -1) val = val.substring(0, dot + 2);
+            mqttSensors[i].value = val;
+            if (currentPage == 0) {
+                drawSensors();
+                canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+            }
+            handled = true;
+            break;
+        }
+    }
+    if (!handled && topicStr == String(CALENDAR_TOPIC)) {
+        String msg = "";
+        for (unsigned int j = 0; j < length; j++) msg += (char)payload[j];
+        calendarMqttMessages.push_back(msg);
+        if (calendarMqttMessages.size() > CALENDAR_MAX_MESSAGES)
+            calendarMqttMessages.erase(calendarMqttMessages.begin());
+        if (currentPage == APPOINTMENTS_PAGE) {
+            drawAppointmentsPage();
+        }
+    }
   }
 }
 
@@ -1888,6 +1970,17 @@ void reconnectMqtt() {
       // Iscriviti al topic di aggiornamento generale
       mqttClient.subscribe("m5paper/update");
       Serial.println("Subscribed to topic: m5paper/update");
+      // Iscriviti al topic chat
+      mqttClient.subscribe(PEBBLE_TOPIC);
+      Serial.println("Subscribed to topic: " + String(PEBBLE_TOPIC));
+      // Iscriviti ai topic sensori MQTT
+      for (int i = 0; i < NUM_MQTT_SENSORS; i++) {
+          mqttClient.subscribe(mqttSensors[i].topic);
+          Serial.println("Subscribed to MQTT sensor: " + String(mqttSensors[i].topic));
+      }
+      // Iscriviti al topic calendario
+      mqttClient.subscribe(CALENDAR_TOPIC);
+      Serial.println("Subscribed to calendar topic: " + String(CALENDAR_TOPIC));
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqttClient.state());
@@ -2029,20 +2122,32 @@ void drawHeader(M5EPD_Canvas* c) {
   // Imposta il font per ora e data
   c->setFreeFont(&FreeSansBold24pt7b);
 
-  // Disegna il titolo, l'ora e la data
   struct tm timeinfo;
   bool timeSynced = getLocalTime(&timeinfo);
   String time_str;
+  String date_str;
   
   if (timeSynced) {
       char timeBuffer[10];
       strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", &timeinfo);
       time_str = String(timeBuffer);
+      
+      const char* weekdays[] = {"Dom", "Lun", "Mar", "Mer", "Gio", "Ven", "Sab"};
+      const char* months[] = {"Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"};
+      
+      int wday = timeinfo.tm_wday;
+      int mday = timeinfo.tm_mday;
+      int mon = timeinfo.tm_mon;
+      
+      if (wday >= 0 && wday < 7 && mon >= 0 && mon < 12) {
+          date_str = String(weekdays[wday]) + " " + String(mday) + " " + String(months[mon]);
+      } else {
+          date_str = getSensorState("sensor.oggi");
+      }
   } else {
       time_str = getSensorState("sensor.time");
+      date_str = getSensorState("sensor.oggi");
   }
-  
-  String date_str = getSensorState("sensor.oggi");
 
   // Sostituisci caratteri accentati che potrebbero non essere supportati dal font
   date_str.replace("à", "a'");
@@ -2089,7 +2194,6 @@ void updateTimeAndDateStates() {
 
     String apiUrl = homeAssistantAddress + "/api/template";
     http.begin(client, apiUrl);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
 
     // Richiesta specifica solo per ora e data, separati da un carattere univoco
@@ -2152,7 +2256,6 @@ std::vector<float> fetchHistory(String entity_id, int hours) {
     
     Serial.println("Fetching history: " + url);
     http.begin(client, url);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
     
     int httpCode = http.GET();
@@ -2546,88 +2649,71 @@ void drawAppointmentsPage() {
     // Pulisci area
     canvas.fillRect(col2_start_x, header_height, col2_width, area_h, WHITE);
 
-    // Titolo
-    canvas.setFreeFont(&FreeSansBold18pt7b);
+    // --- Data di sistema per esteso (in alto) ---
+    struct tm timeinfo;
+    bool timeSynced = getLocalTime(&timeinfo);
+    String fullDateStr = "";
+
+    if (timeSynced) {
+        const char* fullWeekdays[] = {"Domenica", "Lunedi'", "Martedi'", "Mercoledi'", "Giovedi'", "Venerdi'", "Sabato"};
+        const char* fullMonths[] = {"Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno", "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"};
+        int wday = timeinfo.tm_wday;
+        int mday = timeinfo.tm_mday;
+        int mon  = timeinfo.tm_mon;
+        int year = timeinfo.tm_year + 1900;
+        if (wday >= 0 && wday < 7 && mon >= 0 && mon < 12)
+            fullDateStr = String(fullWeekdays[wday]) + " " + String(mday) + " " + String(fullMonths[mon]) + " " + String(year);
+    }
+    if (fullDateStr == "") fullDateStr = "-- / -- / ----";
+
+    // Disegna data in grande in alto
+    canvas.setFreeFont(&FreeSansBold24pt7b);
     canvas.setTextColor(BLACK);
     canvas.setTextDatum(TC_DATUM);
-    canvas.drawString("Appuntamenti di Oggi", col2_start_x + col2_width / 2, header_height + 30);
+    canvas.drawString(fullDateStr, col2_start_x + col2_width / 2, header_height + 40);
 
-    fetchWeatherData(); // Carica i dati meteo
-    fetchWeatherForecast(); // Carica previsioni
-    todayEvents = fetchTodayCalendarEvents(); 
+    // Linea separatrice
+    int sepY = header_height + 90;
+    canvas.drawLine(col2_start_x + 20, sepY, col2_start_x + col2_width - 20, sepY, BLACK);
 
-    int y_pos = header_height + 80;
+    // --- Messaggi MQTT calendario ---
+    canvas.setFreeFont(&FreeSans12pt7b);
+    canvas.setTextColor(BLACK);
+    canvas.setTextDatum(TL_DATUM);
 
-    if (todayEvents.empty()) {
-        canvas.setFreeFont(&FreeSans12pt7b);
+    int lineHeight = 32;
+    int bottomMargin = 20;
+    int y = sepY + 20;
+    int maxLines = (M5EPD_PANEL_H - y - bottomMargin) / lineHeight;
+    if (maxLines < 1) maxLines = 1;
+
+    if (calendarMqttMessages.empty()) {
         canvas.setTextDatum(TC_DATUM);
-        canvas.drawString("Nessun appuntamento per oggi.", col2_start_x + col2_width / 2, y_pos + 20);
-        y_pos += 50; // Sposta la Y verso il basso per posizionare il meteo correttamente
+        canvas.drawString("In attesa di eventi...", col2_start_x + col2_width / 2, y + 30);
     } else {
-        canvas.setFreeFont(&FreeSans12pt7b);
-        canvas.setTextDatum(TL_DATUM);
-        for (const auto& event : todayEvents) {
-            // Formatta l'ora (es. "09:00 - 10:00")
-            String startTimeFormatted = event.startTime.substring(11, 16); // Estrai HH:MM
-            String endTimeFormatted = event.endTime.substring(11, 16);   // Estrai HH:MM
-            
-            String event_details = event.message;
-            if (event_details == "" || event_details == "null") {
-                event_details = event.summary;
-            }
-            String eventText = startTimeFormatted + " - " + endTimeFormatted + ": " + event_details;
-            
-            // Gestione del ritorno a capo se il testo è troppo lungo
-            int max_width = col2_width - 40; // 20px di padding per lato
-            int current_x = col2_start_x + 20;
-
-            String remainingText = eventText;
-            // Controlla se c'è abbastanza spazio per almeno una riga E per il meteo (aumentato spazio richiesto)
-            if (y_pos > M5EPD_PANEL_H - 250) { 
-                break;
-            }
-            while (remainingText.length() > 0) {
-                String line = "";
-                int lastSpace = -1;
-                for (int i = 0; i < remainingText.length(); ++i) {
-                    String testLine = line + remainingText.charAt(i);
-                    if (canvas.textWidth(testLine) > max_width) {
-                        if (lastSpace != -1) {
-                            line = remainingText.substring(0, lastSpace);
-                            remainingText = remainingText.substring(lastSpace + 1);
-                        } else {
-                            line = testLine; // Parola singola troppo lunga, la taglia
-                            remainingText = "";
-                        }
-                        break;
-                    }
-                    if (remainingText.charAt(i) == ' ') {
-                        lastSpace = i;
-                    }
-                    line = testLine;
-                    if (i == remainingText.length() - 1) {
-                        remainingText = ""; // Ultima parte del testo
-                    }
+        int startIdx = (int)calendarMqttMessages.size() > maxLines
+                       ? (int)calendarMqttMessages.size() - maxLines : 0;
+        int maxWidth = col2_width - 40;
+        for (int i = startIdx; i < (int)calendarMqttMessages.size() && y < M5EPD_PANEL_H - bottomMargin; i++) {
+            String line = calendarMqttMessages[i];
+            while (line.length() > 0 && y < M5EPD_PANEL_H - bottomMargin) {
+                if (canvas.textWidth(line) <= maxWidth) {
+                    canvas.drawString(line, col2_start_x + 20, y);
+                    y += lineHeight;
+                    line = "";
+                } else {
+                    int cut = line.length() - 1;
+                    while (cut > 0 && canvas.textWidth(line.substring(0, cut)) > maxWidth) cut--;
+                    int sp = line.lastIndexOf(' ', cut);
+                    if (sp > 0) cut = sp;
+                    canvas.drawString(line.substring(0, cut), col2_start_x + 20, y);
+                    y += lineHeight;
+                    line = line.substring(cut + (line.charAt(cut) == ' ' ? 1 : 0));
                 }
-                canvas.drawString(line, current_x, y_pos);
-                y_pos += 20; // Altezza riga
-                if (y_pos > M5EPD_PANEL_H - 250) { // Controlla di nuovo dentro il loop
-                    break;
-                }
-            }
-            y_pos += 10; // Spazio extra tra gli eventi
-            if (y_pos > M5EPD_PANEL_H - 250) { // E anche qui
-                break;
             }
         }
     }
-    // Disegna le informazioni meteo dinamicamente sotto gli appuntamenti
-    drawWeatherInfo(col2_start_x, y_pos, col2_width);
-    
-    // Disegna il grafico sotto le info meteo
-    y_pos += 80; // Altezza stimata sezione info meteo
-    drawWeatherGraph(col2_start_x, y_pos, col2_width, 140);
-    
+
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
 }
 
@@ -2644,92 +2730,50 @@ void drawLogPage(bool partialUpdate) {
     canvas.setFreeFont(&FreeSansBold18pt7b);
     canvas.setTextColor(BLACK);
     canvas.setTextDatum(TC_DATUM);
-    canvas.drawString("Log: " + logEntityId, col2_start_x + col2_width / 2, header_height + 30);
+    canvas.drawString("Chat: pebble", col2_start_x + col2_width / 2, header_height + 30);
 
-    if (logEntityId == "") {
-        canvas.setFreeFont(&FreeSans12pt7b);
-        canvas.drawString("Nessuna entita' configurata", col2_start_x + col2_width / 2, header_height + 150);
-        canvas.pushCanvas(0, 0, partialUpdate ? UPDATE_MODE_DU : UPDATE_MODE_GC16);
-        return;
-    }
-
-    if (!partialUpdate) showBusyIndicator();
-    
-    // Fetch Log Data
-    std::vector<String> logs;
-    if (WiFi.status() == WL_CONNECTED) {
-        HTTPClient http;
-        WiFiClient client;
-        
-        // Get history for last 24 hours
-        time_t now;
-        time(&now);
-        time_t start = now - (24 * 3600);
-        struct tm * timeinfo;
-        timeinfo = gmtime(&start);
-        char buffer[30];
-        strftime(buffer, 30, "%Y-%m-%dT%H:%M:%S", timeinfo);
-        String timestamp = String(buffer) + "Z";
-
-        String url = homeAssistantAddress + "/api/history/period/" + timestamp + "?filter_entity_id=" + logEntityId;
-        http.begin(client, url);
-        http.addHeader("Authorization", "Bearer " + homeAssistantToken);
-        http.addHeader("Content-Type", "application/json");
-        
-        int httpCode = http.GET();
-        if (httpCode == HTTP_CODE_OK) {
-            WiFiClient *stream = http.getStreamPtr();
-            while (stream->available()) {
-                if (stream->find("\"state\"")) {
-                    if (stream->find("\"")) {
-                        String state = stream->readStringUntil('\"');
-                        if (stream->find("\"last_changed\"")) {
-                            if (stream->find("\"")) {
-                                String last_changed = stream->readStringUntil('\"');
-                                // Parse timestamp (HH:MM)
-                                String timeStr = last_changed.substring(11, 16);
-                                logs.push_back(timeStr + ": " + state);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        http.end();
-    }
-    if (!partialUpdate) hideBusyIndicator();
-
-    // Draw Logs (Last 15 entries)
+    // Disegna i messaggi dal buffer MQTT
     canvas.setFreeFont(&FreeSans12pt7b);
     canvas.setTextDatum(TL_DATUM);
-    int y = header_height + 80;
-    
-    // Calcola dinamicamente il numero massimo di righe in base all'altezza dello schermo
-    int lineHeight = 30;
+
+    int lineHeight = 32;
     int bottomMargin = 20;
+    int y = header_height + 80;
     int maxLines = (M5EPD_PANEL_H - y - bottomMargin) / lineHeight;
     if (maxLines < 1) maxLines = 1;
 
-    int startIdx = (logs.size() > maxLines) ? logs.size() - maxLines : 0;
-    
-    if (logs.empty()) {
+    if (pebbleMessages.empty()) {
         canvas.setTextDatum(TC_DATUM);
-        canvas.drawString("Nessun dato trovato", col2_start_x + col2_width / 2, y);
+        canvas.drawString("In attesa di messaggi...", col2_start_x + col2_width / 2, y + 40);
     } else {
-        // Aggiorna l'ultimo stato noto per il controllo nel loop
-        String lastEntry = logs.back();
-        int sep = lastEntry.indexOf(": ");
-        if (sep != -1) {
-            lastLogState = lastEntry.substring(sep + 2);
-        }
-
-        // Disegna dal più vecchio al più recente (che sarà in fondo)
-        for (int i = startIdx; i < logs.size(); i++) {
-            canvas.drawString(logs[i], col2_start_x + 20, y);
-            y += 30;
+        // Mostra solo gli ultimi maxLines messaggi
+        int startIdx = (int)pebbleMessages.size() > maxLines ? (int)pebbleMessages.size() - maxLines : 0;
+        int maxWidth = col2_width - 40;
+        for (int i = startIdx; i < (int)pebbleMessages.size(); i++) {
+            String line = pebbleMessages[i];
+            // Spezza la riga se troppo lunga
+            while (line.length() > 0) {
+                if (canvas.textWidth(line) <= maxWidth) {
+                    canvas.drawString(line, col2_start_x + 20, y);
+                    y += lineHeight;
+                    line = "";
+                } else {
+                    // Trova il punto di taglio
+                    int cut = line.length() - 1;
+                    while (cut > 0 && canvas.textWidth(line.substring(0, cut)) > maxWidth) cut--;
+                    // Cerca spazio precedente
+                    int sp = line.lastIndexOf(' ', cut);
+                    if (sp > 0) cut = sp;
+                    canvas.drawString(line.substring(0, cut), col2_start_x + 20, y);
+                    y += lineHeight;
+                    line = line.substring(cut + (line.charAt(cut) == ' ' ? 1 : 0));
+                }
+                if (y > M5EPD_PANEL_H - bottomMargin) break;
+            }
+            if (y > M5EPD_PANEL_H - bottomMargin) break;
         }
     }
-    
+
     canvas.pushCanvas(0, 0, partialUpdate ? UPDATE_MODE_DU : UPDATE_MODE_GC16);
 }
 
@@ -2739,7 +2783,6 @@ String fetchCurrentState(String entity_id) {
     WiFiClient client;
     String url = homeAssistantAddress + "/api/states/" + entity_id;
     http.begin(client, url);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
     int httpCode = http.GET();
     String state = "";
@@ -2809,16 +2852,7 @@ void loop() {
       }
   }
 
-  // Controllo rapido aggiornamenti per pagina LOG (ogni 1 secondo)
-  if (currentPage == LOG_PAGE) {
-      if (millis() - lastLogCheckTime > 1000) {
-          lastLogCheckTime = millis();
-          String currentState = fetchCurrentState(logEntityId);
-          if (currentState != "" && currentState != lastLogState) {
-              drawLogPage(true); // Aggiorna se lo stato è cambiato
-          }
-      }
-  }
+  // La pagina LOG ora viene aggiornata direttamente dal callback MQTT
 
   // Controllo Deep Sleep
   // Riattivato per il risparmio energetico. Commenta questa sezione se vuoi il server web sempre attivo.
@@ -3297,7 +3331,6 @@ void fetchMediaDetails(String entity_id) {
     WiFiClient client;
     String url = homeAssistantAddress + "/api/states/" + entity_id;
     http.begin(client, url);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
@@ -3344,7 +3377,6 @@ void setMediaVolume(String entity_id, float volume) {
     HTTPClient http;
     String apiUrl = homeAssistantAddress + "/api/services/media_player/volume_set";
     http.begin(client, apiUrl);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
     String jsonPayload = "{\"entity_id\":\"" + entity_id + "\", \"volume_level\":" + String(volume, 2) + "}";
     http.POST(jsonPayload);
@@ -3357,7 +3389,6 @@ void controlMediaPlayer(String entity_id, String action) {
     HTTPClient http;
     String apiUrl = homeAssistantAddress + "/api/services/media_player/" + action;
     http.begin(client, apiUrl);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
     String jsonPayload = "{\"entity_id\":\"" + entity_id + "\"}";
     http.POST(jsonPayload);
@@ -3375,7 +3406,6 @@ std::vector<CalendarEvent> fetchTodayCalendarEvents() {
     // Modifica: Usa l'API states per leggere direttamente l'entità
     String apiUrl = homeAssistantAddress + "/api/states/" + calendarEntityId;
     http.begin(client, apiUrl);
-    http.addHeader("Authorization", "Bearer " + homeAssistantToken);
     http.addHeader("Content-Type", "application/json");
 
     int httpResponseCode = http.GET(); // Usa GET invece di POST

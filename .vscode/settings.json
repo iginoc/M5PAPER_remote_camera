@@ -1,0 +1,6 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=/home/igino/PlatformIO/Projects/M5PAPER_remote_camera/.cache/clangd",
+        "--query-driver=/home/igino/.platformio/packages/toolchain-*/bin/*,/home/igino/.platformio/packages/tool-*/bin/*"
+    ]
+}
