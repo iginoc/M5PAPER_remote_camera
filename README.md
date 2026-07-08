@@ -3,7 +3,7 @@
 # M5Paper Smart Home Dashboard
 
 A touchscreen firmware for the **M5Stack M5Paper** that turns the e-ink display into a always-on home panel.  
-Data is received primarily via **MQTT** (no Home Assistant token required). Home Assistant REST APIs are used only for lights, switches and scripts control.
+Data is received primarily via **MQTT**.
 
 <p align="center"><img src="screenshots/output.gif" width="600" alt="Home Screen" /></p>
 
@@ -11,7 +11,6 @@ Data is received primarily via **MQTT** (no Home Assistant token required). Home
 
 - **Multi-Page Interface**: Sensors, Home, Lights, Switches, Scripts, Media Player, Analog Clock, Calendar, Appointments/Chat, Log (Chat).
 - **MQTT-First**: Sensor values, chat messages, and calendar events are pushed via MQTT — no polling, near-instant updates.
-- **No Authentication Token**: Communicates with Home Assistant over a trusted network without a long-lived access token.
 - **Web Configuration**: Configure WiFi and MQTT broker via a built-in web interface (no code changes needed).
 - **Fallback Hotspot**: If WiFi is unavailable the device starts `M5Paper_Hotspot` for direct configuration access.
 - **Dynamic Control**: Toggle lights and switches, adjust brightness, control media players (volume, play/pause/next).
@@ -56,7 +55,6 @@ Data is received primarily via **MQTT** (no Home Assistant token required). Home
 | Section | Field | Description |
 |---|---|---|
 | WiFi | Network / Password | Credentials for your home network |
-| Home Assistant | Address | Base URL, e.g. `http://192.168.1.100:8123` (used for lights/switches/scripts only) |
 | MQTT | Server / Port / User / Password | Broker connection details |
 | Power Saving | Deep Sleep / Timeout / Duration | Configurable sleep behaviour |
 
@@ -99,18 +97,7 @@ After the configured inactivity timeout (default: 10 min) the device enters deep
 
 ## Home Assistant Configuration (optional, for control pages)
 
-Only lights, switches and scripts require Home Assistant REST API access. No long-lived token is needed — add the M5Paper IP to the trusted networks in HA:
-
-```yaml
-# configuration.yaml
-homeassistant:
-  auth_providers:
-    - type: homeassistant
-    - type: trusted_networks
-      trusted_networks:
-        - 192.168.1.0/24   # adjust to your LAN subnet
-      allow_bypass_login: true
-```
+This firmware is designed to work primarily with MQTT. Home Assistant integration is no longer required for standard operation.
 
 Groups used by the firmware:
 
@@ -153,7 +140,7 @@ I dati arrivano principalmente tramite **MQTT** (nessun token Home Assistant ric
 
 - **Interfaccia Multi-Pagina**: Sensori, Home, Luci, Switch, Script, Media Player, Orologio Analogico, Calendario, Appuntamenti/Chat, Log (Chat).
 - **MQTT First**: I valori dei sensori, i messaggi di chat e gli eventi del calendario vengono inviati via MQTT — nessun polling, aggiornamenti quasi istantanei.
-- **Nessun Token di Autenticazione**: Comunica con Home Assistant sulla rete locale di fiducia, senza token di accesso di lunga durata.
+- **MQTT-First**: Il dispositivo funziona principalmente con MQTT e non richiede Home Assistant per il funzionamento di base.
 - **Configurazione Web**: Configura WiFi e broker MQTT tramite un'interfaccia web integrata, senza modificare il codice.
 - **Hotspot di Fallback**: Se il WiFi non è disponibile, il dispositivo avvia `M5Paper_Hotspot` per la configurazione diretta.
 - **Controllo Dinamico**: Attiva/disattiva luci e switch, regola la luminosità, controlla i media player (volume, play/pausa/avanti).
@@ -198,7 +185,6 @@ I dati arrivano principalmente tramite **MQTT** (nessun token Home Assistant ric
 | Sezione | Campo | Descrizione |
 |---|---|---|
 | WiFi | Rete / Password | Credenziali della rete di casa |
-| Home Assistant | Indirizzo | URL base, es. `http://192.168.1.100:8123` (usato solo per luci/switch/script) |
 | MQTT | Server / Porta / Utente / Password | Dettagli di connessione al broker |
 | Risparmio Energetico | Deep Sleep / Timeout / Durata | Configurazione del sonno |
 
@@ -241,18 +227,7 @@ Dopo il timeout di inattività configurato (default: 10 min) il dispositivo entr
 
 ## Configurazione Home Assistant (facoltativa, solo per le pagine di controllo)
 
-Solo luci, switch e script richiedono l'accesso alle API REST di Home Assistant. Non è necessario nessun token — aggiungi l'IP del dispositivo alle reti fidate in HA:
-
-```yaml
-# configuration.yaml
-homeassistant:
-  auth_providers:
-    - type: homeassistant
-    - type: trusted_networks
-      trusted_networks:
-        - 192.168.1.0/24   # adatta alla tua sottorete LAN
-      allow_bypass_login: true
-```
+Il firmware è progettato per funzionare principalmente con MQTT. L'accesso a Home Assistant è opzionale e non è richiesto per l'uso standard.
 
 Gruppi usati dal firmware:
 

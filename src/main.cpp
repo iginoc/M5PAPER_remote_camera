@@ -1132,69 +1132,58 @@ void loadGroupLights() {
 }
 
 void loadGroupSwitches() {
-  if (homeAssistantAddress == "") return;
-  showBusyIndicator();
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  WiFiClient client;
-  String apiUrl = homeAssistantAddress + "/api/template";
-  
-  // Template per ottenere entity_id, friendly_name e state separati da | e coppie separate da ;
-  String templateBody = "{% set entities = state_attr('switch.gruppo_switch', 'entity_id') %}{% if entities %}{% for entity in entities %}{{ entity }}|{{ state_attr(entity, 'friendly_name') }}|{{ states(entity) }}{% if not loop.last %};{% endif %}{% endfor %}{% endif %}";
-  String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
-
-  http.begin(client, apiUrl);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpResponseCode = http.POST(jsonPayload);
-  if (httpResponseCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    
-    // Pulisci i pulsanti
-    for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
-        gridButtons[i].entity_id = "";
-        gridButtons[i].name = "";
-        gridButtons[i].type = "";
-        gridButtons[i].state = "off";
-    }
-
-    int startIndex = 0;
-    int btnIndex = 0;
-    const int maxSwitchButtons = NUM_GRID_BUTTONS - 2; // riserva due slot per i comandi CLIMA
-    while (startIndex < payload.length() && btnIndex < maxSwitchButtons) {
-        int endIndex = payload.indexOf(';', startIndex);
-        if (endIndex == -1) endIndex = payload.length();
-        
-        String triplet = payload.substring(startIndex, endIndex);
-        int firstPipe = triplet.indexOf('|');
-        int secondPipe = triplet.indexOf('|', firstPipe + 1);
-
-        if (firstPipe != -1 && secondPipe != -1) {
-            gridButtons[btnIndex].entity_id = triplet.substring(0, firstPipe);
-            gridButtons[btnIndex].name = triplet.substring(firstPipe + 1, secondPipe);
-            gridButtons[btnIndex].type = "switch"; 
-            gridButtons[btnIndex].state = triplet.substring(secondPipe + 1);
-            btnIndex++;
-        }
-        startIndex = endIndex + 1;
-    }
-
-    if (NUM_GRID_BUTTONS >= 2) {
-        gridButtons[NUM_GRID_BUTTONS - 2].entity_id = "";
-        gridButtons[NUM_GRID_BUTTONS - 2].name = "CLIMA ON";
-        gridButtons[NUM_GRID_BUTTONS - 2].type = "daikin_clima";
-        gridButtons[NUM_GRID_BUTTONS - 2].state = "off";
-
-        gridButtons[NUM_GRID_BUTTONS - 1].entity_id = "";
-        gridButtons[NUM_GRID_BUTTONS - 1].name = "CLIMA OFF";
-        gridButtons[NUM_GRID_BUTTONS - 1].type = "daikin_clima";
-        gridButtons[NUM_GRID_BUTTONS - 1].state = "off";
-    }
+  // Pulisci i pulsanti in modo da non lasciare elementi della pagina HOME
+  for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
+      gridButtons[i].entity_id = "";
+      gridButtons[i].name = "";
+      gridButtons[i].type = "";
+      gridButtons[i].state = "off";
   }
-  http.end();
 
-  // Assicura che i pulsanti CLIMA compaiano sempre, anche se HA non risponde.
+  bool canFetchSwitches = (homeAssistantAddress != "" && WiFi.status() == WL_CONNECTED);
+  if (canFetchSwitches) {
+    showBusyIndicator();
+    HTTPClient http;
+    WiFiClient client;
+    String apiUrl = homeAssistantAddress + "/api/template";
+    
+    // Template per ottenere entity_id, friendly_name e state separati da | e coppie separate da ;
+    String templateBody = "{% set entities = state_attr('switch.gruppo_switch', 'entity_id') %}{% if entities %}{% for entity in entities %}{{ entity }}|{{ state_attr(entity, 'friendly_name') }}|{{ states(entity) }}{% if not loop.last %};{% endif %}{% endfor %}{% endif %}";
+    String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
+
+    http.begin(client, apiUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.POST(jsonPayload);
+    if (httpResponseCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+
+      int startIndex = 0;
+      int btnIndex = 0;
+      const int maxSwitchButtons = NUM_GRID_BUTTONS - 2; // riserva due slot per i comandi CLIMA
+      while (startIndex < payload.length() && btnIndex < maxSwitchButtons) {
+          int endIndex = payload.indexOf(';', startIndex);
+          if (endIndex == -1) endIndex = payload.length();
+          
+          String triplet = payload.substring(startIndex, endIndex);
+          int firstPipe = triplet.indexOf('|');
+          int secondPipe = triplet.indexOf('|', firstPipe + 1);
+
+          if (firstPipe != -1 && secondPipe != -1) {
+              gridButtons[btnIndex].entity_id = triplet.substring(0, firstPipe);
+              gridButtons[btnIndex].name = triplet.substring(firstPipe + 1, secondPipe);
+              gridButtons[btnIndex].type = "switch"; 
+              gridButtons[btnIndex].state = triplet.substring(secondPipe + 1);
+              btnIndex++;
+          }
+          startIndex = endIndex + 1;
+      }
+    }
+    http.end();
+    hideBusyIndicator();
+  }
+
+  // Assicura che i pulsanti CLIMA compaiano sempre.
   if (NUM_GRID_BUTTONS >= 2) {
       gridButtons[NUM_GRID_BUTTONS - 2].entity_id = "";
       gridButtons[NUM_GRID_BUTTONS - 2].name = "CLIMA ON";
@@ -1206,8 +1195,6 @@ void loadGroupSwitches() {
       gridButtons[NUM_GRID_BUTTONS - 1].type = "daikin_clima";
       gridButtons[NUM_GRID_BUTTONS - 1].state = "off";
   }
-
-  hideBusyIndicator();
 }
 
 void loadGroupScripts() {
@@ -1875,10 +1862,6 @@ void handleWifiConfig() {
     html += "</select><br>";
     html += "<input type='password' name='password' placeholder='Password' value='" + password + "'><br>";
     
-    html += "<h3>Home Assistant</h3>";
-    html += "<label>Indirizzo:</label><br>";
-    html += "<input type='text' name='ha_address' value='" + homeAssistantAddress + "'><br>";
-    
     html += "<h3>MQTT</h3>";
     html += "<label>Server:</label><br>";
     html += "<input type='text' name='mqtt_server' value='" + mqtt_server + "'><br>";
@@ -1923,16 +1906,10 @@ void handleSaveWifi() {
     if (server.hasArg("ssid")) {
         String new_ssid = server.arg("ssid");
         String new_pass = server.arg("password");
-        String new_ha_address = server.arg("ha_address");
         
         preferences.begin("epaper", false);
         preferences.putString("ssid", encryptConfig(new_ssid));
         preferences.putString("password", encryptConfig(new_pass));
-        if (new_ha_address.length() > 0) preferences.putString("ha_address", encryptConfig(new_ha_address));
-        
-        if (server.hasArg("calendar_entity")) preferences.putString("calendarEntity", encryptConfig(server.arg("calendar_entity")));
-        if (server.hasArg("media_entity")) preferences.putString("mediaEntity", encryptConfig(server.arg("media_entity")));
-  if (server.hasArg("log_entity")) preferences.putString("logEntity", encryptConfig(server.arg("log_entity")));
 
         if (server.hasArg("mqtt_server")) preferences.putString("mqtt_server", encryptConfig(server.arg("mqtt_server")));
         if (server.hasArg("mqtt_port")) preferences.putInt("mqtt_port", server.arg("mqtt_port").toInt());
@@ -1982,15 +1959,16 @@ void handleFactoryReset() {
 void handleSetPage() {
     if (server.hasArg("page")) {
         int page = server.arg("page").toInt();
-        int haPageValue = 0;
-        if (page == 0) haPageValue = 4; // SENSORI
-        else if (page == 1) haPageValue = 3; // HOME
-        else if (page == 2) haPageValue = 2; // LUCI
-        else if (page == 3) haPageValue = 1; // SWITCH
-
-        if (haPageValue != 0) {
-            setPageInputNumber(haPageValue);
-            // Non è necessario ridisegnare qui, il loop principale lo farà tramite updateStates
+        if (page >= 0 && page <= 3) {
+            currentPage = page;
+            if (currentPage == 3) {
+                loadGroupSwitches();
+            } else if (currentPage == 2) {
+                loadGroupLights();
+            } else if (currentPage == 0) {
+                loadGroupSensors();
+            }
+            drawFullUI(false);
         }
         server.sendHeader("Location", "/");
         server.send(303);
@@ -2051,9 +2029,6 @@ void setup() {
   ssid = decryptConfig(preferences.getString("ssid", ""));
   password = decryptConfig(preferences.getString("password", ""));
   
-  String savedHaAddress = decryptConfig(preferences.getString("ha_address", ""));
-  if (savedHaAddress != "") homeAssistantAddress = savedHaAddress;
-  
   mqtt_server = decryptConfig(preferences.getString("mqtt_server", mqtt_server));
   mqtt_port = preferences.getInt("mqtt_port", mqtt_port);
   mqtt_user = decryptConfig(preferences.getString("mqtt_user", mqtt_user));
@@ -2071,10 +2046,6 @@ void setup() {
   deepSleepEnabled = preferences.getBool("ds_enabled", true);
   SLEEP_TIMEOUT = preferences.getULong("ds_timeout", 10) * 60000; // Salvato in minuti, converto in ms
   DEEP_SLEEP_TIME = (uint64_t)preferences.getULong("ds_duration", 10) * 60 * 1000000ULL; // Salvato in minuti, converto in us
-
-  calendarEntityId = decryptConfig(preferences.getString("calendarEntity", calendarEntityId));
-  defaultMediaEntityId = decryptConfig(preferences.getString("mediaEntity", defaultMediaEntityId));
-  logEntityId = decryptConfig(preferences.getString("logEntity", logEntityId));
 
   preferences.end();
 
@@ -2137,11 +2108,6 @@ void setup() {
     server.on("/deepsleep", handleDeepSleep);
   server.begin();
   Serial.println("HTTP server started");
-
-  // Sincronizza Home Assistant sulla pagina HOME (valore 3)
-  if (homeAssistantAddress != "") {
-      setPageInputNumber(3);
-  }
 
   if (currentPage == 0) {
       loadGroupSensors();
@@ -2270,46 +2236,6 @@ void drawFullUI(bool syncPage) {
   // Crea il canvas con le dimensioni corrispondenti alla rotazione (540x960)
   canvas.createCanvas(M5EPD_PANEL_W, M5EPD_PANEL_H);
 
-  // Controllo configurazione Home Assistant
-  if (homeAssistantAddress == "") {
-      M5.EPD.SetColorReverse(false); // Forza sfondo bianco (modalità chiara) per leggibilità
-      canvas.fillCanvas(WHITE);
-      canvas.setTextColor(BLACK);
-      
-      int y = 80;
-      canvas.setFreeFont(&FreeSansBold18pt7b);
-      canvas.setTextDatum(TC_DATUM); // Allineamento Top-Center
-      canvas.drawString("Home Assistant non configurato!", M5EPD_PANEL_W / 2, y);
-      y += 50;
-      
-      canvas.setFreeFont(&FreeSans12pt7b);
-      canvas.drawString("Configura l'indirizzo IP tramite Web Server", M5EPD_PANEL_W / 2, y);
-      y += 40;
-      
-      String ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-      String url = "http://" + ipStr;
-      canvas.drawString(url, M5EPD_PANEL_W / 2, y);
-      y += 40;
-      
-      int qrSize = 200;
-      int qrX = (M5EPD_PANEL_W - qrSize) / 2;
-      canvas.qrcode(url.c_str(), qrX, y, qrSize, 2);
-      
-      // Pulsante Factory Reset
-      int btnW = 220;
-      int btnH = 50;
-      int btnX = (M5EPD_PANEL_W - btnW) / 2;
-      int btnY = M5EPD_PANEL_H - 80;
-      
-      canvas.fillRect(btnX, btnY, btnW, btnH, BLACK);
-      canvas.setTextColor(WHITE);
-      canvas.setTextDatum(MC_DATUM);
-      canvas.drawString("Factory Reset", btnX + btnW/2, btnY + btnH/2);
-      
-      drawHeader();
-      canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-      return;
-  }
 
   // IMPOSTA LA POSIZIONE DEI PULSANTI DELLA GRIGLIA 1x4 NELLA PRIMA COLONNA
   const int col1_width = (M5EPD_PANEL_W * 0.3) - 22;
@@ -2332,14 +2258,6 @@ void drawFullUI(bool syncPage) {
   canvas.fillCanvas(WHITE); // Sfondo bianco
   // La cornice è stata rimossa.
   canvas.setTextColor(BLACK); // Testo nero
-
-  // Ottieni lo stato di ora e data prima di tutto per l'header
-  updateTimeAndDateStates(); // Carica i dati per ora e data
-
-  // Ottieni lo stato iniziale di tutti i dispositivi e sensori con una sola chiamata
-  // Escludiamo i sensori perché li abbiamo già gestiti (o li gestiremo separatamente)
-  // In questo caso, carichiamo tutto per semplicità.
-  updateStates(true, true, syncPage); 
 
   drawHeader();
   drawButtons();
@@ -2910,35 +2828,6 @@ void loop() {
       lastActivityTime = millis(); // Resetta il timer di sonno al tocco
       tp_finger_t finger = M5.TP.readFinger(0);
 
-      // Gestione tocco nella schermata di avviso (HA non configurato)
-      if (homeAssistantAddress == "") {
-          int btnW = 220;
-          int btnH = 50;
-          int btnX = (M5EPD_PANEL_W - btnW) / 2;
-          int btnY = M5EPD_PANEL_H - 80;
-          
-          if (finger.x >= btnX && finger.x <= btnX + btnW &&
-              finger.y >= btnY && finger.y <= btnY + btnH) {
-              
-              // Feedback visivo
-              M5EPD_Canvas btnCanvas(&M5.EPD);
-              btnCanvas.createCanvas(btnW, btnH);
-              btnCanvas.fillCanvas(WHITE);
-              btnCanvas.drawRect(0, 0, btnW, btnH, BLACK);
-              btnCanvas.setTextColor(BLACK);
-              btnCanvas.setFreeFont(&FreeSans12pt7b);
-              btnCanvas.setTextDatum(MC_DATUM);
-              btnCanvas.drawString("Resetting...", btnW/2, btnH/2);
-              btnCanvas.pushCanvas(btnX, btnY, UPDATE_MODE_DU);
-              
-              delay(500);
-              handleFactoryReset(); // Riutilizza la funzione di reset
-          }
-          // Ignora altri tocchi in questa schermata
-          while(!M5.TP.isFingerUp()) { M5.TP.update(); }
-          return;
-      }
-      
       // Controllo tocco Header (Batteria per Dark Mode)
       if (finger.y < 80) {
           // Area approssimativa della batteria (y=20, h=28, w=66)
@@ -3014,6 +2903,7 @@ void loop() {
               currentPage = 3;
               setPageInputNumber(1);
               loadGroupSwitches();
+              canvas.fillRect(0, 0, M5EPD_PANEL_W, M5EPD_PANEL_H, WHITE);
               drawHeader();
               drawButtons();
               drawGridButtons();
