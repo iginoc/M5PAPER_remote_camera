@@ -12,7 +12,7 @@ Data is received primarily via **MQTT** (no Home Assistant token required). Home
 - **Multi-Page Interface**: Sensors, Home, Lights, Switches, Scripts, Media Player, Analog Clock, Calendar, Appointments/Chat, Log (Chat).
 - **MQTT-First**: Sensor values, chat messages, and calendar events are pushed via MQTT — no polling, near-instant updates.
 - **No Authentication Token**: Communicates with Home Assistant over a trusted network without a long-lived access token.
-- **Web Configuration**: Configure WiFi, MQTT broker and OpenWeatherMap via a built-in web interface (no code changes needed).
+- **Web Configuration**: Configure WiFi and MQTT broker via a built-in web interface (no code changes needed).
 - **Fallback Hotspot**: If WiFi is unavailable the device starts `M5Paper_Hotspot` for direct configuration access.
 - **Dynamic Control**: Toggle lights and switches, adjust brightness, control media players (volume, play/pause/next).
 - **Sensor Grid**: First two tiles always show live MQTT values (`potenza_totale`, `sensore_zigbee_temperatura`). Additional HA sensors fill the remaining tiles with pagination.
@@ -45,7 +45,7 @@ Data is received primarily via **MQTT** (no Home Assistant token required). Home
    - On first boot (or if credentials are invalid) the device shows the configuration page directly.
    - Connect to the **"M5Paper_Hotspot"** WiFi network.
    - Open a browser at `http://192.168.4.1`.
-   - Fill in your WiFi credentials, MQTT broker details, and (optionally) OpenWeatherMap API key and city.
+   - Fill in your WiFi credentials and MQTT broker details.
    - Save. The device will reboot and connect to your network.
 3. **Later Configuration**:
    - Access the web interface at the device IP address (shown in the header).
@@ -58,7 +58,6 @@ Data is received primarily via **MQTT** (no Home Assistant token required). Home
 | WiFi | Network / Password | Credentials for your home network |
 | Home Assistant | Address | Base URL, e.g. `http://192.168.1.100:8123` (used for lights/switches/scripts only) |
 | MQTT | Server / Port / User / Password | Broker connection details |
-| OpenWeatherMap | API Token / City | Weather data for the Appointments page |
 | Power Saving | Deep Sleep / Timeout / Duration | Configurable sleep behaviour |
 
 ## User Interface
@@ -155,7 +154,7 @@ I dati arrivano principalmente tramite **MQTT** (nessun token Home Assistant ric
 - **Interfaccia Multi-Pagina**: Sensori, Home, Luci, Switch, Script, Media Player, Orologio Analogico, Calendario, Appuntamenti/Chat, Log (Chat).
 - **MQTT First**: I valori dei sensori, i messaggi di chat e gli eventi del calendario vengono inviati via MQTT — nessun polling, aggiornamenti quasi istantanei.
 - **Nessun Token di Autenticazione**: Comunica con Home Assistant sulla rete locale di fiducia, senza token di accesso di lunga durata.
-- **Configurazione Web**: Configura WiFi, broker MQTT e OpenWeatherMap tramite un'interfaccia web integrata, senza modificare il codice.
+- **Configurazione Web**: Configura WiFi e broker MQTT tramite un'interfaccia web integrata, senza modificare il codice.
 - **Hotspot di Fallback**: Se il WiFi non è disponibile, il dispositivo avvia `M5Paper_Hotspot` per la configurazione diretta.
 - **Controllo Dinamico**: Attiva/disattiva luci e switch, regola la luminosità, controlla i media player (volume, play/pausa/avanti).
 - **Griglia Sensori**: Le prime due celle mostrano sempre i valori MQTT live (`potenza_totale`, `sensore_zigbee_temperatura`). I sensori HA riempiono le celle rimanenti con paginazione.
@@ -188,7 +187,7 @@ I dati arrivano principalmente tramite **MQTT** (nessun token Home Assistant ric
    - Al primo avvio (o se le credenziali non sono valide) il dispositivo mostra direttamente la pagina di configurazione.
    - Connettiti all'hotspot WiFi **"M5Paper_Hotspot"**.
    - Apri un browser su `http://192.168.4.1`.
-   - Inserisci le credenziali WiFi, i dati del broker MQTT e, facoltativamente, il token e la città di OpenWeatherMap.
+   - Inserisci le credenziali WiFi e i dati del broker MQTT.
    - Salva. Il dispositivo si riavvierà e si connetterà alla rete.
 3. **Configurazione Successiva**:
    - Accedi all'interfaccia web all'indirizzo IP del dispositivo (visibile nell'header).
@@ -201,7 +200,6 @@ I dati arrivano principalmente tramite **MQTT** (nessun token Home Assistant ric
 | WiFi | Rete / Password | Credenziali della rete di casa |
 | Home Assistant | Indirizzo | URL base, es. `http://192.168.1.100:8123` (usato solo per luci/switch/script) |
 | MQTT | Server / Porta / Utente / Password | Dettagli di connessione al broker |
-| OpenWeatherMap | Token API / Città | Dati meteo per la pagina Appuntamenti |
 | Risparmio Energetico | Deep Sleep / Timeout / Durata | Configurazione del sonno |
 
 ## Interfaccia Utente

@@ -1,6 +1,7 @@
 #include <M5EPD.h>
 #include <M5EPD_Driver.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h> // Necessario per le chiamate HTTPS all'API Daikin ONECTA
 #include <vector> // Aggiunto per usare std::vector
 #include <HTTPClient.h>
 #include <PubSubClient.h> // Aggiunta la libreria MQTT
@@ -25,20 +26,24 @@ String password = "";
 String calendarEntityId = "calendar.famiglia"; // Entità calendario configurabile
 String defaultMediaEntityId = ""; // Media player predefinito
 String logEntityId = ""; // Entità per il log
-// Aggiunta per OpenWeatherMap
-String openWeatherMapApiToken = "";
-String openWeatherMapCity = "";
-String weatherIcon = "";
-String weatherTemp = "";
-String weatherDescription = "";
 
-struct WeatherForecast {
-    String time;
-    float temp;
-    String icon;
-    float pop;
-};
-std::vector<WeatherForecast> weatherForecasts;
+String daikinClientId = "";
+String daikinClientSecret = "";
+String daikinRedirectUri = "";
+// Il refresh_token si ottiene UNA TANTUM facendo il login OAuth2 con il tool CLI
+// (github.com/iginoc/daikin), che stampa/salva il token dopo il flusso authorization_code.
+// Va poi incollato nella pagina di configurazione web del display: da quel momento il
+// display rinnova da solo l'access token (grant_type=refresh_token) senza bisogno di browser.
+String daikinRefreshToken = "";
+// Id del gateway-device Daikin (visibile col tool CLI, es. tramite getDevices()).
+String daikinDeviceId = "";
+// Access token corrente e relativa scadenza (epoch, secondi). Persistiti su NVS così
+// sopravvivono al deep sleep e non si spreca una richiesta di refresh ad ogni risveglio
+// (l'API Daikin ONECTA ha un limite di 200 richieste/giorno per account).
+String daikinAccessToken = "";
+long daikinTokenExpiresAt = 0;
+// "management point" fisso usato dai climatizzatori Daikin sull'API ONECTA.
+const char* DAIKIN_MANAGEMENT_POINT = "climateControl";
 
 // --- IMPOSTAZIONI MQTT ---
 String mqtt_server = ""; 
@@ -68,7 +73,7 @@ struct DeviceButton {
 
 const int NUM_DEVICES = 4;
 DeviceButton devices[NUM_DEVICES] = {
-    {"switch.gruppo_switch", "SWITCH", "off", 0, 0, 0, 0, "group"},
+    {"switch.gruppo_switch", "CLIMA", "off", 0, 0, 0, 0, "group"},
     {"light.gruppo_luci", "LIGHTS", "off", 0, 0, 0, 0, "group"},
     {"", "HOME", "off", 0, 0, 0, 0, ""},
     {"", "SENSORS", "off", 0, 0, 0, 0, ""},
@@ -221,12 +226,18 @@ void handleDeepSleep();
 String encryptConfig(String input);
 String decryptConfig(String input);
 // Funzioni per il meteo
-void fetchWeatherData();
-void fetchWeatherForecast();
-void drawWeatherInfo(int x, int y, int w);
-void drawWeatherGraph(int x, int y, int w, int h);
-void drawWeatherIcon(String icon, int x, int y, int size);
 String fetchCurrentState(String entity_id);
+// --- Daikin ONECTA OAuth2 ---
+bool daikinEnsureValidAccessToken();
+bool daikinRefreshAccessToken();
+bool daikinRequestToken(const String& body);
+bool daikinPatchCharacteristic(const String& characteristic, const String& jsonBody);
+bool daikinSetOperationMode(const String& mode);
+bool daikinSetTargetTemperature(const String& operationMode, float temperature);
+void saveDaikinTokens();
+String daikinUrlEncode(const String& value);
+String extractJsonString(const String& payload, const String& key);
+long extractJsonLong(const String& payload, const String& key, long defaultValue);
 
 
 // Funzione helper per trovare lo stato di un sensore tramite il suo entity_id
@@ -314,6 +325,220 @@ void setPageInputNumber(int pageValue) {
   hideBusyIndicator();
 }
 
+// --- Daikin ONECTA: helper OAuth2 e chiamate API -------------------------------
+// Porting su ESP32/Arduino della logica di github.com/iginoc/daikin (daikin_client.cpp):
+// stesso flusso OAuth2 (authorization_code fatto una tantum col tool CLI + refresh_token
+// qui sul device), stessi endpoint idp.onecta.daikineurope.com / api.onecta.daikineurope.com,
+// stesso schema di chiamate PATCH sulle "characteristics" del management point.
+
+// Estrae il valore di una chiave stringa da un JSON semplice, es. "access_token":"xyz"
+// (tollerante a eventuali spazi dopo i due punti, es. "access_token": "xyz").
+// Stesso approccio di parsing manuale già usato altrove nel file (vedi fetchTodayCalendarEvents()),
+// per non introdurre una libreria JSON aggiuntiva.
+String extractJsonString(const String& payload, const String& key) {
+    String pattern = "\"" + key + "\"";
+    int keyPos = payload.indexOf(pattern);
+    if (keyPos == -1) return "";
+    int cursor = keyPos + pattern.length();
+    // Salta spazi ed eventuali due punti prima del valore.
+    while (cursor < (int)payload.length() && (payload[cursor] == ' ' || payload[cursor] == ':')) cursor++;
+    if (cursor >= (int)payload.length() || payload[cursor] != '"') return "";
+    int valStart = cursor + 1;
+    int valEnd = payload.indexOf("\"", valStart);
+    if (valEnd == -1) return "";
+    return payload.substring(valStart, valEnd);
+}
+
+// Estrae il valore di una chiave numerica JSON non tra virgolette, es. "expires_in":3600
+// (tollerante a spazi dopo i due punti).
+long extractJsonLong(const String& payload, const String& key, long defaultValue) {
+    String pattern = "\"" + key + "\"";
+    int keyPos = payload.indexOf(pattern);
+    if (keyPos == -1) return defaultValue;
+    int cursor = keyPos + pattern.length();
+    while (cursor < (int)payload.length() && (payload[cursor] == ' ' || payload[cursor] == ':')) cursor++;
+    int valStart = cursor;
+    int valEnd = valStart;
+    while (valEnd < (int)payload.length() && isDigit(payload[valEnd])) valEnd++;
+    if (valEnd == valStart) return defaultValue;
+    return payload.substring(valStart, valEnd).toInt();
+}
+
+// URL-encode minimale per i parametri form-urlencoded del token endpoint OAuth2.
+String daikinUrlEncode(const String& value) {
+    String encoded = "";
+    char buf[4];
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value.charAt(i);
+        if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded += c;
+        } else {
+            snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+            encoded += buf;
+        }
+    }
+    return encoded;
+}
+
+// Persiste su NVS (cifrati come le altre credenziali) l'access/refresh token correnti,
+// così sopravvivono al deep sleep e ai riavvii senza dover rifare il login.
+void saveDaikinTokens() {
+    preferences.begin("epaper", false);
+    preferences.putString("daikin_atok", encryptConfig(daikinAccessToken));
+    preferences.putString("daikin_rtok", encryptConfig(daikinRefreshToken));
+    preferences.putLong("daikin_texp", daikinTokenExpiresAt);
+    preferences.end();
+}
+
+// POST condiviso verso il token endpoint OAuth2 (usato sia per il refresh che, in
+// teoria, per un futuro exchange authorization_code fatto direttamente dal device).
+bool daikinRequestToken(const String& body) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    WiFiClientSecure client;
+    // NOTA SICUREZZA: setInsecure() salta la verifica del certificato TLS. Per una
+    // verifica completa sostituire con client.setCACert(...) usando il certificato
+    // radice di idp.onecta.daikineurope.com (es. ISRG Root X1 / Let's Encrypt).
+    client.setInsecure();
+
+    HTTPClient http;
+    if (!http.begin(client, "https://idp.onecta.daikineurope.com/v1/oidc/token")) {
+        Serial.println("Daikin: impossibile aprire la connessione al token endpoint.");
+        return false;
+    }
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    http.setTimeout(15000);
+
+    int httpCode = http.POST(body);
+    String payload = http.getString();
+    http.end();
+
+    if (httpCode != 200) {
+        Serial.printf("Daikin: richiesta token fallita (HTTP %d): %s\n", httpCode, payload.c_str());
+        return false;
+    }
+
+    // Log completo della risposta: utile per diagnosticare eventuali cambi di formato
+    // dell'API. IMPORTANTE: l'API Daikin usa refresh token "rotanti" e monouso, cioè
+    // ogni refresh riuscito lato server invalida il refresh token precedente anche se
+    // qui non riuscissimo a leggerlo correttamente. Per questo logghiamo sempre tutto.
+    Serial.println("Daikin: risposta token endpoint: " + payload);
+
+    String newAccessToken = extractJsonString(payload, "access_token");
+    if (newAccessToken == "") {
+        Serial.println("Daikin: risposta token senza access_token (vedi payload sopra per capire perché).");
+        return false;
+    }
+    daikinAccessToken = newAccessToken;
+
+    // Non tutti i refresh restituiscono un nuovo refresh_token: se assente si mantiene
+    // quello già salvato (stesso comportamento del client CLI di riferimento).
+    String newRefreshToken = extractJsonString(payload, "refresh_token");
+    if (newRefreshToken != "") daikinRefreshToken = newRefreshToken;
+
+    long expiresIn = extractJsonLong(payload, "expires_in", 3600);
+    daikinTokenExpiresAt = (long)time(nullptr) + expiresIn - 60; // 60s di margine di sicurezza
+
+    saveDaikinTokens();
+    return true;
+}
+
+// Rinnova l'access token usando il refresh token salvato. Se manca (o non è più valido,
+// es. revocato), va rifatto il login OAuth2 col tool CLI e reincollato il nuovo token
+// nella pagina di configurazione web del display.
+bool daikinRefreshAccessToken() {
+    if (daikinRefreshToken == "" || daikinClientId == "" || daikinClientSecret == "") {
+        Serial.println("Daikin: refresh_token, client_id o client_secret mancanti. Rifare il login con il tool CLI (github.com/iginoc/daikin).");
+        return false;
+    }
+
+    String body = "grant_type=refresh_token";
+    body += "&refresh_token=" + daikinUrlEncode(daikinRefreshToken);
+    body += "&client_id=" + daikinUrlEncode(daikinClientId);
+    body += "&client_secret=" + daikinUrlEncode(daikinClientSecret);
+
+    return daikinRequestToken(body);
+}
+
+// Garantisce un access token valido, rinnovandolo solo se scaduto o vicino a scadere,
+// per non sprecare inutilmente le richieste giornaliere concesse dall'API Daikin.
+bool daikinEnsureValidAccessToken() {
+    if (daikinAccessToken != "" && (long)time(nullptr) < daikinTokenExpiresAt) {
+        return true; // token ancora valido
+    }
+    return daikinRefreshAccessToken();
+}
+
+// Invia un comando PATCH a una "characteristic" del management point del climatizzatore
+// (es. onOffMode, operationMode, temperatureControl), come in daikin_client.cpp::patchDeviceValue.
+bool daikinPatchCharacteristic(const String& characteristic, const String& jsonBody) {
+    if (daikinDeviceId == "") {
+        Serial.println("Daikin: device_id non configurato (recuperabile col tool CLI, es. lista dispositivi).");
+        return false;
+    }
+    if (!daikinEnsureValidAccessToken()) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    String url = "https://api.onecta.daikineurope.com/v1/gateway-devices/" + daikinDeviceId +
+                 "/management-points/" + String(DAIKIN_MANAGEMENT_POINT) +
+                 "/characteristics/" + characteristic;
+
+    WiFiClientSecure client;
+    client.setInsecure(); // vedi nota su daikinRequestToken() riguardo alla verifica TLS
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+        Serial.println("Daikin: impossibile aprire la connessione all'API.");
+        return false;
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + daikinAccessToken);
+    http.setTimeout(15000);
+
+    int httpCode = http.PATCH(jsonBody);
+    String payload = http.getString();
+    http.end();
+
+    if (httpCode == 429) {
+        Serial.println("Daikin: limite di 200 richieste/giorno raggiunto. Riprova più tardi.");
+        return false;
+    }
+    if (httpCode != 204 && httpCode != 200) {
+        Serial.printf("Daikin: errore PATCH %s (HTTP %d): %s\n", characteristic.c_str(), httpCode, payload.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Accende/spegne il climatizzatore (chiamata dal pulsante "CLIMA" della griglia).
+void toggleDaikinClima(bool on) {
+  showBusyIndicator();
+  if (daikinRefreshToken == "" || daikinDeviceId == "" || daikinClientId == "" || daikinClientSecret == "") {
+      Serial.println("Daikin config incompleta: client_id, client_secret, refresh_token o device_id mancanti.");
+      hideBusyIndicator();
+      return;
+  }
+
+  String jsonBody = "{\"value\":\"" + String(on ? "on" : "off") + "\"}";
+  bool ok = daikinPatchCharacteristic("onOffMode", jsonBody);
+  Serial.printf("Daikin: CLIMA %s -> %s\n", on ? "ON" : "OFF", ok ? "OK" : "ERRORE");
+  hideBusyIndicator();
+}
+
+// Cambia la modalità operativa: "fanOnly", "heating", "cooling", "auto", "dry".
+// IMPORTANTE: la temperatura impostata con daikinSetTargetTemperature() deve usare la
+// STESSA modalità qui impostata, altrimenti l'unità la ignora silenziosamente.
+bool daikinSetOperationMode(const String& mode) {
+    return daikinPatchCharacteristic("operationMode", "{\"value\":\"" + mode + "\"}");
+}
+
+// Cambia la temperatura target per una specifica modalità operativa. Il valore deve
+// rispettare i vincoli min/max/step dell'unità (leggibili da /gateway-devices).
+bool daikinSetTargetTemperature(const String& operationMode, float temperature) {
+    String path = "/operationModes/" + operationMode + "/setpoints/roomTemperature";
+    String jsonBody = "{\"value\":" + String(temperature, 1) + ",\"path\":\"" + path + "\"}";
+    return daikinPatchCharacteristic("temperatureControl", jsonBody);
+}
+
 void toggleWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Turning WiFi OFF...");
@@ -321,7 +546,7 @@ void toggleWiFi() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     Serial.println("WiFi is OFF.");
-    drawFullUI(); 
+    drawFullUI();
   } else {
     Serial.println("Turning WiFi ON...");
     WiFi.mode(WIFI_STA);
@@ -936,7 +1161,8 @@ void loadGroupSwitches() {
 
     int startIndex = 0;
     int btnIndex = 0;
-    while (startIndex < payload.length() && btnIndex < NUM_GRID_BUTTONS) {
+    const int maxSwitchButtons = NUM_GRID_BUTTONS - 2; // riserva due slot per i comandi CLIMA
+    while (startIndex < payload.length() && btnIndex < maxSwitchButtons) {
         int endIndex = payload.indexOf(';', startIndex);
         if (endIndex == -1) endIndex = payload.length();
         
@@ -953,8 +1179,34 @@ void loadGroupSwitches() {
         }
         startIndex = endIndex + 1;
     }
+
+    if (NUM_GRID_BUTTONS >= 2) {
+        gridButtons[NUM_GRID_BUTTONS - 2].entity_id = "";
+        gridButtons[NUM_GRID_BUTTONS - 2].name = "CLIMA ON";
+        gridButtons[NUM_GRID_BUTTONS - 2].type = "daikin_clima";
+        gridButtons[NUM_GRID_BUTTONS - 2].state = "off";
+
+        gridButtons[NUM_GRID_BUTTONS - 1].entity_id = "";
+        gridButtons[NUM_GRID_BUTTONS - 1].name = "CLIMA OFF";
+        gridButtons[NUM_GRID_BUTTONS - 1].type = "daikin_clima";
+        gridButtons[NUM_GRID_BUTTONS - 1].state = "off";
+    }
   }
   http.end();
+
+  // Assicura che i pulsanti CLIMA compaiano sempre, anche se HA non risponde.
+  if (NUM_GRID_BUTTONS >= 2) {
+      gridButtons[NUM_GRID_BUTTONS - 2].entity_id = "";
+      gridButtons[NUM_GRID_BUTTONS - 2].name = "CLIMA ON";
+      gridButtons[NUM_GRID_BUTTONS - 2].type = "daikin_clima";
+      gridButtons[NUM_GRID_BUTTONS - 2].state = "off";
+
+      gridButtons[NUM_GRID_BUTTONS - 1].entity_id = "";
+      gridButtons[NUM_GRID_BUTTONS - 1].name = "CLIMA OFF";
+      gridButtons[NUM_GRID_BUTTONS - 1].type = "daikin_clima";
+      gridButtons[NUM_GRID_BUTTONS - 1].state = "off";
+  }
+
   hideBusyIndicator();
 }
 
@@ -1637,11 +1889,17 @@ void handleWifiConfig() {
     html += "<label>Password:</label><br>";
     html += "<input type='password' name='mqtt_password' value='" + mqtt_password + "'><br>";
 
-    html += "<h3>OpenWeatherMap</h3>";
-    html += "<label>API Token:</label><br>";
-    html += "<input type='text' name='owm_token' value='" + openWeatherMapApiToken + "'><br>";
-    html += "<label>Citt&agrave;:</label><br>";
-    html += "<input type='text' name='owm_city' value='" + openWeatherMapCity + "'><br>";
+    html += "<h3>Daikin OneCTA</h3>";
+    html += "<label>Client ID:</label><br>";
+    html += "<input type='text' name='daikin_client_id' value='" + daikinClientId + "'><br>";
+    html += "<label>Client Secret:</label><br>";
+    html += "<input type='password' name='daikin_client_secret' value='" + daikinClientSecret + "'><br>";
+    html += "<label>Redirect URI:</label><br>";
+    html += "<input type='text' name='daikin_redirect_uri' value='" + daikinRedirectUri + "'><br>";
+    html += "<label>Device ID (dal tool CLI 'daikin'):</label><br>";
+    html += "<input type='text' name='daikin_device_id' value='" + daikinDeviceId + "'><br>";
+    html += "<label>Refresh Token (login una tantum col tool CLI):</label><br>";
+    html += "<input type='password' name='daikin_refresh_token' value='" + daikinRefreshToken + "' placeholder='incolla qui il refresh_token ottenuto col tool CLI'><br>";
 
     html += "<h3>Risparmio Energetico</h3>";
     html += "<label>Deep Sleep:</label><br>";
@@ -1681,10 +1939,18 @@ void handleSaveWifi() {
         if (server.hasArg("mqtt_user")) preferences.putString("mqtt_user", encryptConfig(server.arg("mqtt_user")));
         if (server.hasArg("mqtt_password")) preferences.putString("mqtt_password", encryptConfig(server.arg("mqtt_password")));
 
-        // Salva configurazione OpenWeatherMap
-        if (server.hasArg("owm_token")) preferences.putString("owm_token", encryptConfig(server.arg("owm_token")));
-        if (server.hasArg("owm_city")) preferences.putString("owm_city", encryptConfig(server.arg("owm_city")));
-        
+        if (server.hasArg("daikin_client_id")) preferences.putString("daikin_cid", encryptConfig(server.arg("daikin_client_id")));
+        if (server.hasArg("daikin_client_secret")) preferences.putString("daikin_csec", encryptConfig(server.arg("daikin_client_secret")));
+        if (server.hasArg("daikin_redirect_uri")) preferences.putString("daikin_ruri", encryptConfig(server.arg("daikin_redirect_uri")));
+        if (server.hasArg("daikin_device_id")) preferences.putString("daikin_devid", encryptConfig(server.arg("daikin_device_id")));
+        if (server.hasArg("daikin_refresh_token") && server.arg("daikin_refresh_token") != "") {
+            // Un nuovo refresh_token incollato manualmente invalida l'access token corrente,
+            // così al prossimo comando viene subito richiesto un nuovo access token coerente.
+            preferences.putString("daikin_rtok", encryptConfig(server.arg("daikin_refresh_token")));
+            preferences.putString("daikin_atok", encryptConfig(""));
+            preferences.putLong("daikin_texp", 0);
+        }
+
         if (server.hasArg("ds_enabled")) preferences.putBool("ds_enabled", server.arg("ds_enabled").toInt());
         if (server.hasArg("ds_timeout")) preferences.putULong("ds_timeout", server.arg("ds_timeout").toInt());
         if (server.hasArg("ds_duration")) preferences.putULong("ds_duration", server.arg("ds_duration").toInt());
@@ -1793,6 +2059,14 @@ void setup() {
   mqtt_user = decryptConfig(preferences.getString("mqtt_user", mqtt_user));
   mqtt_password = decryptConfig(preferences.getString("mqtt_password", mqtt_password));
 
+  daikinClientId = decryptConfig(preferences.getString("daikin_cid", daikinClientId));
+  daikinClientSecret = decryptConfig(preferences.getString("daikin_csec", daikinClientSecret));
+  daikinRedirectUri = decryptConfig(preferences.getString("daikin_ruri", daikinRedirectUri));
+  daikinDeviceId = decryptConfig(preferences.getString("daikin_devid", daikinDeviceId));
+  daikinRefreshToken = decryptConfig(preferences.getString("daikin_rtok", daikinRefreshToken));
+  daikinAccessToken = decryptConfig(preferences.getString("daikin_atok", daikinAccessToken));
+  daikinTokenExpiresAt = preferences.getLong("daikin_texp", 0);
+
   // Carica impostazioni Deep Sleep
   deepSleepEnabled = preferences.getBool("ds_enabled", true);
   SLEEP_TIMEOUT = preferences.getULong("ds_timeout", 10) * 60000; // Salvato in minuti, converto in ms
@@ -1801,9 +2075,6 @@ void setup() {
   calendarEntityId = decryptConfig(preferences.getString("calendarEntity", calendarEntityId));
   defaultMediaEntityId = decryptConfig(preferences.getString("mediaEntity", defaultMediaEntityId));
   logEntityId = decryptConfig(preferences.getString("logEntity", logEntityId));
-  // Carica configurazione OpenWeatherMap
-  openWeatherMapApiToken = decryptConfig(preferences.getString("owm_token", ""));
-  openWeatherMapCity = decryptConfig(preferences.getString("owm_city", ""));
 
   preferences.end();
 
@@ -2377,269 +2648,6 @@ void drawGraph(String entity_id, String name, int hours) {
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
 }
 
-void fetchWeatherData() {
-    if (openWeatherMapApiToken == "" || openWeatherMapCity == "" || WiFi.status() != WL_CONNECTED) {
-        weatherDescription = "N/A";
-        weatherTemp = "";
-        weatherIcon = "";
-        return;
-    }
-
-    HTTPClient http;
-    WiFiClient client;
-    String url = "http://api.openweathermap.org/data/2.5/weather?q=" + openWeatherMapCity + "&appid=" + openWeatherMapApiToken + "&units=metric&lang=it";
-    
-    Serial.println("Fetching weather data from: " + url);
-    http.begin(client, url);
-    
-    int httpCode = http.GET();
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-        Serial.println("Weather Payload: " + payload);
-
-        // --- Parsing JSON manualmente ---
-        // Estrai temperatura da {"main":{"temp":...}}
-        int mainIndex = payload.indexOf("\"main\":{");
-        if (mainIndex != -1) {
-            int tempIndex = payload.indexOf("\"temp\":", mainIndex);
-            if (tempIndex != -1) {
-                int tempValueStart = tempIndex + 7;
-                int tempValueEnd = payload.indexOf(",", tempValueStart);
-                weatherTemp = payload.substring(tempValueStart, tempValueEnd);
-                // Arrotonda
-                int dotIndex = weatherTemp.indexOf('.');
-                if (dotIndex != -1) {
-                    weatherTemp = weatherTemp.substring(0, dotIndex);
-                }
-            }
-        }
-
-        // Estrai descrizione e icona da {"weather":[{"description":"...","icon":"..."}]}
-        int weatherIndex = payload.indexOf("\"weather\":[{");
-        if (weatherIndex != -1) {
-            int descIndex = payload.indexOf("\"description\":\"", weatherIndex);
-            if (descIndex != -1) {
-                int descValueStart = descIndex + 15;
-                int descValueEnd = payload.indexOf("\"", descValueStart);
-                weatherDescription = payload.substring(descValueStart, descValueEnd);
-                weatherDescription.toUpperCase();
-            }
-            int iconIndex = payload.indexOf("\"icon\":\"", weatherIndex);
-            if (iconIndex != -1) {
-                int iconValueStart = iconIndex + 8;
-                int iconValueEnd = payload.indexOf("\"", iconValueStart);
-                weatherIcon = payload.substring(iconValueStart, iconValueEnd);
-            }
-        }
-
-        Serial.println("Weather: " + weatherDescription + ", " + weatherTemp + "C, icon: " + weatherIcon);
-    } else {
-        Serial.printf("[HTTP] Weather fetch failed, error: %s\n", http.errorToString(httpCode).c_str());
-        weatherDescription = "Errore Meteo";
-        weatherTemp = "";
-        weatherIcon = "";
-    }
-    http.end();
-}
-
-void fetchWeatherForecast() {
-    if (openWeatherMapApiToken == "" || openWeatherMapCity == "" || WiFi.status() != WL_CONNECTED) return;
-    
-    HTTPClient http;
-    WiFiClient client;
-    // Richiedi previsioni (cnt=5 per circa 15 ore, step di 3 ore)
-    String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + openWeatherMapCity + "&appid=" + openWeatherMapApiToken + "&units=metric&lang=it&cnt=5";
-    
-    Serial.println("Fetching weather forecast from: " + url);
-    http.begin(client, url);
-    
-    int httpCode = http.GET();
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-        weatherForecasts.clear();
-        
-        int index = 0;
-        for (int i = 0; i < 5; i++) {
-            // Trova timestamp
-            int dtIdx = payload.indexOf("\"dt\":", index);
-            if (dtIdx == -1) break;
-            
-            int dtValStart = dtIdx + 5;
-            int dtValEnd = payload.indexOf(",", dtValStart);
-            String dtStr = payload.substring(dtValStart, dtValEnd);
-            time_t dt = dtStr.toInt();
-            struct tm* timeinfo = localtime(&dt);
-            char timeBuf[6];
-            strftime(timeBuf, 6, "%H:%M", timeinfo);
-            
-            // Trova Temperatura
-            int tempIdx = payload.indexOf("\"temp\":", dtIdx);
-            float temp = 0;
-            if (tempIdx != -1) {
-                int tStart = tempIdx + 7;
-                int tEnd = payload.indexOf(",", tStart);
-                temp = payload.substring(tStart, tEnd).toFloat();
-            }
-            
-            // Trova Icona
-            int iconIdx = payload.indexOf("\"icon\":\"", dtIdx);
-            String icon = "";
-            if (iconIdx != -1) {
-                int iStart = iconIdx + 8;
-                int iEnd = payload.indexOf("\"", iStart);
-                icon = payload.substring(iStart, iEnd);
-            }
-            
-            // Trova Probabilità di Pioggia (POP)
-            int popIdx = payload.indexOf("\"pop\":", dtIdx);
-            float pop = 0.0;
-            if (popIdx != -1) {
-                // Verifica che sia prima del prossimo blocco
-                int nextDt = payload.indexOf("\"dt\":", dtIdx + 1);
-                if (nextDt == -1 || popIdx < nextDt) {
-                    int pStart = popIdx + 6;
-                    int pEnd = payload.indexOf(",", pStart);
-                    int pEndBrace = payload.indexOf("}", pStart);
-                    if (pEnd == -1 || (pEndBrace != -1 && pEndBrace < pEnd)) pEnd = pEndBrace;
-                    if (pEnd != -1) pop = payload.substring(pStart, pEnd).toFloat();
-                }
-            }
-            
-            weatherForecasts.push_back({String(timeBuf), temp, icon, pop});
-            index = iconIdx + 1;
-        }
-        Serial.printf("Fetched %d forecast points\n", weatherForecasts.size());
-    }
-    http.end();
-}
-
-void drawWeatherGraph(int x, int y, int w, int h) {
-    if (weatherForecasts.empty()) return;
-    if (y + h > M5EPD_PANEL_H) return;
-
-    // Trova min/max per scalare il grafico
-    float minT = weatherForecasts[0].temp;
-    float maxT = weatherForecasts[0].temp;
-    for (const auto& f : weatherForecasts) {
-        if (f.temp < minT) minT = f.temp;
-        if (f.temp > maxT) maxT = f.temp;
-    }
-    minT -= 1.0; // Margine
-    maxT += 1.0;
-    float range = maxT - minT;
-    if (range < 2.0) range = 2.0;
-
-    int numPoints = weatherForecasts.size();
-    int stepX = w / numPoints;
-    int startX = x + stepX / 2;
-
-    canvas.setFreeFont(&FreeSans9pt7b);
-    canvas.setTextDatum(TC_DATUM);
-    
-    int graphY = y + 40; // Spazio per icone sopra
-    int graphH = h - 80; // Spazio per orari e pop sotto
-
-    for (int i = 0; i < numPoints; i++) {
-        int px = startX + i * stepX;
-        
-        // Disegna Icona
-        drawWeatherIcon(weatherForecasts[i].icon, px, y + 20, 30);
-        
-        // Calcola Y del punto
-        int py = graphY + graphH - (int)((weatherForecasts[i].temp - minT) / range * graphH);
-        
-        // Disegna linea verso il prossimo punto
-        if (i < numPoints - 1) {
-            int nextPx = startX + (i + 1) * stepX;
-            int nextPy = graphY + graphH - (int)((weatherForecasts[i+1].temp - minT) / range * graphH);
-            canvas.drawLine(px, py, nextPx, nextPy, 3, BLACK);
-        }
-        
-        // Disegna punto e etichetta temperatura
-        canvas.fillCircle(px, py, 4, BLACK);
-        canvas.drawString(String((int)round(weatherForecasts[i].temp)) + "°", px, py - 20);
-        
-        // Disegna Probabilità Pioggia se significativa (>0)
-        if (weatherForecasts[i].pop > 0.0) {
-            int popPct = (int)(weatherForecasts[i].pop * 100);
-            canvas.setFreeFont(&FreeSans9pt7b);
-            canvas.drawString(String(popPct) + "%", px, y + h - 38);
-        }
-        
-        // Disegna Orario
-        canvas.drawString(weatherForecasts[i].time, px, y + h - 20);
-    }
-}
-
-void drawWeatherIcon(String icon, int x, int y, int size) {
-    // Simple icon mapping
-    if (icon.startsWith("01")) { // clear sky
-        canvas.fillCircle(x, y, size / 2, BLACK);
-        canvas.fillCircle(x, y, size / 2 - 4, WHITE);
-    } else if (icon.startsWith("02")) { // few clouds
-        canvas.fillCircle(x + size/4, y - size/8, size / 3, BLACK);
-        canvas.fillCircle(x - size/4, y + size/8, size / 3, BLACK);
-        canvas.fillCircle(x, y, size / 2, WHITE);
-        canvas.drawCircle(x, y, size / 2, BLACK);
-    } else if (icon.startsWith("03") || icon.startsWith("04")) { // scattered/broken clouds
-        canvas.fillCircle(x + size/4, y - size/8, size / 3, BLACK);
-        canvas.fillCircle(x - size/4, y + size/8, size / 3, BLACK);
-        canvas.fillRect(x - size/3, y, size*2/3, size/3, BLACK);
-    } else if (icon.startsWith("09") || icon.startsWith("10")) { // shower rain/rain
-        canvas.fillCircle(x + size/4, y - size/4, size / 3, BLACK);
-        canvas.fillCircle(x - size/4, y - size/8, size / 3, BLACK);
-        canvas.fillRect(x - size/3, y - size/4, size*2/3, size/3, BLACK);
-        canvas.drawLine(x - size/4, y, x - size/8, y + size/2, 2, BLACK);
-        canvas.drawLine(x + size/8, y, x + size/4, y + size/2, 2, BLACK);
-    } else if (icon.startsWith("11")) { // thunderstorm
-        canvas.fillCircle(x + size/4, y - size/4, size / 3, BLACK);
-        canvas.fillCircle(x - size/4, y - size/8, size / 3, BLACK);
-        canvas.fillRect(x - size/3, y - size/4, size*2/3, size/3, BLACK);
-        canvas.fillTriangle(x, y, x - size/4, y + size/2, x + size/4, y + size/2, BLACK);
-    } else if (icon.startsWith("13")) { // snow
-        canvas.fillCircle(x + size/4, y - size/4, size / 3, BLACK);
-        canvas.fillCircle(x - size/4, y - size/8, size / 3, BLACK);
-        canvas.fillRect(x - size/3, y - size/4, size*2/3, size/3, BLACK);
-        canvas.drawCircle(x, y + size/4, 3, BLACK);
-        canvas.drawCircle(x - size/3, y + size/3, 3, BLACK);
-        canvas.drawCircle(x + size/3, y + size/3, 3, BLACK);
-    } else { // default
-        canvas.drawRect(x - size/2, y - size/2, size, size, BLACK);
-        canvas.drawString("?", x, y);
-    }
-}
-
-void drawWeatherInfo(int x, int y, int w) {
-    // Non disegnare se non c'è abbastanza spazio verticale
-    if (y > M5EPD_PANEL_H - 100) {
-        return;
-    }
-
-    y += 20; // Spazio dopo gli appuntamenti o il messaggio
-    canvas.fillRect(x, y, w, 2, BLACK); // Linea di separazione
-    y += 10; // Spazio dopo la linea
-
-    int icon_x = x + 40;
-    int icon_y = y + 40;
-    if (weatherIcon != "") {
-        drawWeatherIcon(weatherIcon, icon_x, icon_y, 60);
-    }
-
-    int text_x = x + 90; // Posizione X per i testi a destra dell'icona
-
-    // Disegna la temperatura (grande, in alto)
-    canvas.setFreeFont(&FreeSansBold24pt7b);
-    canvas.setTextDatum(TL_DATUM);
-    if (weatherTemp != "") {
-        canvas.drawString(weatherTemp + "°C", text_x, y + 5);
-    }
-
-    // Disegna la descrizione (piccola, in basso)
-    canvas.setFreeFont(&FreeSans12pt7b);
-    canvas.setTextDatum(TL_DATUM);
-    canvas.drawString(weatherDescription, text_x, y + 45);
-}
-
 void drawAppointmentsPage() {
     const int header_height = 80;
     const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
@@ -3118,6 +3126,13 @@ void loop() {
                loadGroupScripts();
                drawHeader();
                drawButtons();
+               drawGridButtons();
+               canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+               break;
+          } else if (String(gridButtons[i].type) == "daikin_clima") {
+               bool turnOn = (gridButtons[i].name == "CLIMA ON");
+               toggleDaikinClima(turnOn);
+               drawHeader();
                drawGridButtons();
                canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
                break;
