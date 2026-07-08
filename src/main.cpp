@@ -45,6 +45,11 @@ long daikinTokenExpiresAt = 0;
 // "management point" fisso usato dai climatizzatori Daikin sull'API ONECTA.
 const char* DAIKIN_MANAGEMENT_POINT = "climateControl";
 
+float daikinOutdoorTemperature = NAN;
+float daikinIndoorTemperature = NAN;
+int daikinIndoorHumidity = -1;
+bool daikinStatusAvailable = false;
+
 // --- IMPOSTAZIONI MQTT ---
 String mqtt_server = ""; 
 int mqtt_port = 1883;
@@ -216,6 +221,7 @@ void drawLogPage(bool partialUpdate = false);
 void controlMediaPlayer(String entity_id, String action);
 void drawHotspotControl(); // Sostituisce drawCalendar
 void drawAnalogClock();
+bool fetchDaikinSensoryData();
 void handleScreenshot();
 void handleViewScreenshot();
 void handleWifiConfig();
@@ -238,6 +244,7 @@ void saveDaikinTokens();
 String daikinUrlEncode(const String& value);
 String extractJsonString(const String& payload, const String& key);
 long extractJsonLong(const String& payload, const String& key, long defaultValue);
+float extractJsonNumberAfter(const String& payload, const String& key, int startIndex, float defaultValue);
 
 
 // Funzione helper per trovare lo stato di un sensore tramite il suo entity_id
@@ -380,11 +387,98 @@ String daikinUrlEncode(const String& value) {
     return encoded;
 }
 
+float extractJsonNumberAfter(const String& payload, const String& key, int startIndex, float defaultValue) {
+    int keyPos = payload.indexOf(key, startIndex);
+    if (keyPos == -1) return defaultValue;
+    int valuePos = payload.indexOf("\"value\"", keyPos);
+    if (valuePos == -1) return defaultValue;
+    int colon = payload.indexOf(':', valuePos);
+    if (colon == -1) return defaultValue;
+    int cursor = colon + 1;
+    while (cursor < (int)payload.length() && (payload[cursor] == ' ' || payload[cursor] == '\n' || payload[cursor] == '\r' || payload[cursor] == '\t')) cursor++;
+    int end = cursor;
+    bool seenDot = false;
+    if (end < (int)payload.length() && (payload[end] == '-' || payload[end] == '+')) end++;
+    while (end < (int)payload.length()) {
+        char c = payload[end];
+        if (c >= '0' && c <= '9') {
+            end++;
+            continue;
+        }
+        if (!seenDot && c == '.') {
+            seenDot = true;
+            end++;
+            continue;
+        }
+        break;
+    }
+    if (end == cursor || (payload[cursor] == '-' && end == cursor + 1)) return defaultValue;
+    return payload.substring(cursor, end).toFloat();
+}
+
+bool fetchDaikinSensoryData() {
+    if (daikinDeviceId == "") return false;
+    if (!daikinEnsureValidAccessToken()) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    String url = "https://api.onecta.daikineurope.com/v1/gateway-devices/" + daikinDeviceId + "/management-points/" + String(DAIKIN_MANAGEMENT_POINT);
+    if (!http.begin(client, url)) {
+        Serial.println("Daikin: impossibile aprire la connessione all'API per i dati sensoriali.");
+        return false;
+    }
+    http.addHeader("Authorization", "Bearer " + daikinAccessToken);
+    http.addHeader("Accept", "application/json");
+    http.setTimeout(15000);
+
+    int httpCode = http.GET();
+    if (httpCode <= 0) {
+        Serial.printf("Daikin: errore GET client %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
+        http.end();
+        return false;
+    }
+    if (httpCode != HTTP_CODE_OK) {
+        String payload = http.getString();
+        Serial.printf("Daikin: errore GET status %d: %s\n", httpCode, payload.c_str());
+        http.end();
+        return false;
+    }
+
+    String payload = http.getString();
+    http.end();
+
+    int sensoryPos = payload.indexOf("\"sensoryData\"");
+    if (sensoryPos == -1) {
+        Serial.println("Daikin: sensoryData non trovata nella risposta.");
+        return false;
+    }
+
+    float outdoorTemp = extractJsonNumberAfter(payload, "\"outdoorTemperature\"", sensoryPos, NAN);
+    float indoorTemp = extractJsonNumberAfter(payload, "\"roomTemperature\"", sensoryPos, NAN);
+    float indoorHumidity = extractJsonNumberAfter(payload, "\"roomHumidity\"", sensoryPos, NAN);
+
+    if (!isnan(outdoorTemp)) {
+        daikinOutdoorTemperature = outdoorTemp;
+    }
+    if (!isnan(indoorTemp)) {
+        daikinIndoorTemperature = indoorTemp;
+    }
+    if (indoorHumidity >= 0) {
+        daikinIndoorHumidity = (int)indoorHumidity;
+    }
+    daikinStatusAvailable = true;
+    return true;
+}
+
 // Persiste su NVS (cifrati come le altre credenziali) l'access/refresh token correnti,
 // così sopravvivono al deep sleep e ai riavvii senza dover rifare il login.
 void saveDaikinTokens() {
     preferences.begin("epaper", false);
-    preferences.putString("daikin_atok", encryptConfig(daikinAccessToken));
+    // Non memorizziamo l'access token completo su NVS: basta il refresh token.
+    // Questo evita errori di NVS NOT_ENOUGH_SPACE con token molto lunghi.
+    preferences.remove("daikin_atok");
     preferences.putString("daikin_rtok", encryptConfig(daikinRefreshToken));
     preferences.putLong("daikin_texp", daikinTokenExpiresAt);
     preferences.end();
@@ -1021,17 +1115,31 @@ void drawGridButtons() {
     const int col2_width = M5EPD_PANEL_W - col2_start_x;
     const int cols = 3;
     const int rows = 4;
-
-    // Rimuovi i margini e calcola la dimensione dei pulsanti per riempire lo spazio
     const int margin_x = 0;
     const int margin_y = 0;
+    const int infoPanelHeight = (currentPage == 3) ? 100 : 0;
+    if (currentPage == 3) {
+        int panelY = header_height + 10;
+        canvas.fillRect(col2_start_x, panelY, col2_width, infoPanelHeight, WHITE);
+        canvas.drawRect(col2_start_x, panelY, col2_width, infoPanelHeight, BLACK);
+        canvas.setFreeFont(&FreeSans12pt7b);
+        canvas.setTextDatum(TL_DATUM);
+        if (daikinStatusAvailable) {
+            canvas.drawString("EST: " + String(daikinOutdoorTemperature, 1) + "\u00b0C", col2_start_x + 10, panelY + 18);
+            canvas.drawString("INT: " + String(daikinIndoorTemperature, 1) + "\u00b0C", col2_start_x + 10, panelY + 40);
+            canvas.drawString("UMID: " + String(daikinIndoorHumidity) + " %", col2_start_x + 10, panelY + 62);
+            canvas.drawString("Daikin status", col2_start_x + 10, panelY + 84);
+        } else {
+            canvas.drawString("Daikin dati non disponibili", col2_start_x + 10, panelY + 34);
+            canvas.drawString("Controlla configurazione o WiFi.", col2_start_x + 10, panelY + 58);
+        }
+    }
+    if (currentPage == 3) {
+        start_y += infoPanelHeight;
+    }
+
     const int btn_w = col2_width / cols;
     const int btn_h = (M5EPD_PANEL_H - start_y) / rows;
-    
-    // Pulisci l'area della griglia prima di disegnarla per evitare sovrapposizioni
-    canvas.fillRect(col2_start_x, header_height, col2_width, M5EPD_PANEL_H - header_height, WHITE);
-
-    canvas.setFreeFont(&FreeSansBold12pt7b);
 
     for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
         if (gridButtons[i].name == "" && gridButtons[i].entity_id == "") {
@@ -1181,6 +1289,11 @@ void loadGroupSwitches() {
     }
     http.end();
     hideBusyIndicator();
+  }
+
+  daikinStatusAvailable = false;
+  if (WiFi.status() == WL_CONNECTED && daikinDeviceId != "") {
+      fetchDaikinSensoryData();
   }
 
   // Assicura che i pulsanti CLIMA compaiano sempre.
@@ -1924,7 +2037,7 @@ void handleSaveWifi() {
             // Un nuovo refresh_token incollato manualmente invalida l'access token corrente,
             // così al prossimo comando viene subito richiesto un nuovo access token coerente.
             preferences.putString("daikin_rtok", encryptConfig(server.arg("daikin_refresh_token")));
-            preferences.putString("daikin_atok", encryptConfig(""));
+            preferences.remove("daikin_atok");
             preferences.putLong("daikin_texp", 0);
         }
 
@@ -2040,6 +2153,7 @@ void setup() {
   daikinDeviceId = decryptConfig(preferences.getString("daikin_devid", daikinDeviceId));
   daikinRefreshToken = decryptConfig(preferences.getString("daikin_rtok", daikinRefreshToken));
   daikinAccessToken = decryptConfig(preferences.getString("daikin_atok", daikinAccessToken));
+  preferences.remove("daikin_atok");
   daikinTokenExpiresAt = preferences.getLong("daikin_texp", 0);
 
   // Carica impostazioni Deep Sleep
