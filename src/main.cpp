@@ -1,7 +1,6 @@
 #include <M5EPD.h>
 #include <M5EPD_Driver.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h> // Necessario per le chiamate HTTPS all'API Daikin ONECTA
 #include <vector> // Aggiunto per usare std::vector
 #include <HTTPClient.h>
 #include <PubSubClient.h> // Aggiunta la libreria MQTT
@@ -24,31 +23,7 @@ String homeAssistantAddress = "";
 String ssid = ""; 
 String password = ""; 
 String calendarEntityId = "calendar.famiglia"; // Entità calendario configurabile
-String defaultMediaEntityId = ""; // Media player predefinito
 String logEntityId = ""; // Entità per il log
-
-String daikinClientId = "";
-String daikinClientSecret = "";
-String daikinRedirectUri = "";
-// Il refresh_token si ottiene UNA TANTUM facendo il login OAuth2 con il tool CLI
-// (github.com/iginoc/daikin), che stampa/salva il token dopo il flusso authorization_code.
-// Va poi incollato nella pagina di configurazione web del display: da quel momento il
-// display rinnova da solo l'access token (grant_type=refresh_token) senza bisogno di browser.
-String daikinRefreshToken = "";
-// Id del gateway-device Daikin (visibile col tool CLI, es. tramite getDevices()).
-String daikinDeviceId = "";
-// Access token corrente e relativa scadenza (epoch, secondi). Persistiti su NVS così
-// sopravvivono al deep sleep e non si spreca una richiesta di refresh ad ogni risveglio
-// (l'API Daikin ONECTA ha un limite di 200 richieste/giorno per account).
-String daikinAccessToken = "";
-long daikinTokenExpiresAt = 0;
-// "management point" fisso usato dai climatizzatori Daikin sull'API ONECTA.
-const char* DAIKIN_MANAGEMENT_POINT = "climateControl";
-
-float daikinOutdoorTemperature = NAN;
-float daikinIndoorTemperature = NAN;
-int daikinIndoorHumidity = -1;
-bool daikinStatusAvailable = false;
 
 // --- IMPOSTAZIONI MQTT ---
 String mqtt_server = ""; 
@@ -130,21 +105,28 @@ int currentGraphDuration = 24;
 
 const int CLOCK_PAGE = 6;         // Pagina orologio analogico
 const int CALENDAR_PAGE = 7;      // Pagina calendario
-const int SCRIPT_PAGE = 8;        // Pagina script
-const int MEDIA_CONTROL_PAGE = 9; // Pagina controllo media
+const int CHESS_PAGE = 8;         // Pagina scacchi
 const int LOG_PAGE = 12;          // Pagina log
+
+// --- STATO SCACCHI ---
+char chessBoard[8][8] = {
+    {'r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'},
+    {'p', 'p', 'p', 'p', 'p', 'p', 'p', 'p'},
+    {'.', '.', '.', '.', '.', '.', '.', '.'},
+    {'.', '.', '.', '.', '.', '.', '.', '.'},
+    {'.', '.', '.', '.', '.', '.', '.', '.'},
+    {'.', '.', '.', '.', '.', '.', '.', '.'},
+    {'P', 'P', 'P', 'P', 'P', 'P', 'P', 'P'},
+    {'R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'}
+};
+int chessSelectedX = -1;
+int chessSelectedY = -1;
 // --- STATO CONTROLLO LUCE ---
 const int LIGHT_CONTROL_PAGE = 5;
 String selectedLightEntity = "";
 String selectedLightName = "";
 int selectedLightBrightness = 0;
 String selectedLightState = "off";
-
-// --- STATO CONTROLLO MEDIA ---
-String selectedMediaEntity = "";
-String selectedMediaName = "";
-String selectedMediaState = "off";
-float selectedMediaVolume = 0.0; // Volume è un float da 0.0 a 1.0
 
 const int APPOINTMENTS_PAGE = 10; // Nuova pagina per gli appuntamenti
 const int WEEK_VIEW_PAGE = 11;    // Nuova pagina per la vista settimanale
@@ -198,10 +180,6 @@ WebServer server(80); // Server Web sulla porta 80
 void drawFullUI(bool syncPage = true); // Dichiarazione forward della funzione
 void drawGridButtons();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
-void loadGroupLights();
-void loadGroupSwitches();
-void loadGroupSensors();
-void loadGroupScripts();
 void reconnectMqtt();
 void drawHeader(M5EPD_Canvas* c = &canvas);
 void updateTimeAndDateStates(); 
@@ -211,17 +189,13 @@ void hideBusyIndicator();
 void fetchLightDetails(String entity_id);
 void setLightBrightness(String entity_id, int brightness);
 void drawLightControlPage();
-void drawMediaControlPage();
 std::vector<CalendarEvent> fetchTodayCalendarEvents();
 void drawAppointmentsPage();
 void drawWeekView();
-void fetchMediaDetails(String entity_id);
-void setMediaVolume(String entity_id, float volume);
 void drawLogPage(bool partialUpdate = false);
-void controlMediaPlayer(String entity_id, String action);
 void drawHotspotControl(); // Sostituisce drawCalendar
 void drawAnalogClock();
-bool fetchDaikinSensoryData();
+void drawChessBoard();
 void handleScreenshot();
 void handleViewScreenshot();
 void handleWifiConfig();
@@ -233,18 +207,6 @@ String encryptConfig(String input);
 String decryptConfig(String input);
 // Funzioni per il meteo
 String fetchCurrentState(String entity_id);
-// --- Daikin ONECTA OAuth2 ---
-bool daikinEnsureValidAccessToken();
-bool daikinRefreshAccessToken();
-bool daikinRequestToken(const String& body);
-bool daikinPatchCharacteristic(const String& characteristic, const String& jsonBody);
-bool daikinSetOperationMode(const String& mode);
-bool daikinSetTargetTemperature(const String& operationMode, float temperature);
-void saveDaikinTokens();
-String daikinUrlEncode(const String& value);
-String extractJsonString(const String& payload, const String& key);
-long extractJsonLong(const String& payload, const String& key, long defaultValue);
-float extractJsonNumberAfter(const String& payload, const String& key, int startIndex, float defaultValue);
 
 
 // Funzione helper per trovare lo stato di un sensore tramite il suo entity_id
@@ -332,306 +294,6 @@ void setPageInputNumber(int pageValue) {
   hideBusyIndicator();
 }
 
-// --- Daikin ONECTA: helper OAuth2 e chiamate API -------------------------------
-// Porting su ESP32/Arduino della logica di github.com/iginoc/daikin (daikin_client.cpp):
-// stesso flusso OAuth2 (authorization_code fatto una tantum col tool CLI + refresh_token
-// qui sul device), stessi endpoint idp.onecta.daikineurope.com / api.onecta.daikineurope.com,
-// stesso schema di chiamate PATCH sulle "characteristics" del management point.
-
-// Estrae il valore di una chiave stringa da un JSON semplice, es. "access_token":"xyz"
-// (tollerante a eventuali spazi dopo i due punti, es. "access_token": "xyz").
-// Stesso approccio di parsing manuale già usato altrove nel file (vedi fetchTodayCalendarEvents()),
-// per non introdurre una libreria JSON aggiuntiva.
-String extractJsonString(const String& payload, const String& key) {
-    String pattern = "\"" + key + "\"";
-    int keyPos = payload.indexOf(pattern);
-    if (keyPos == -1) return "";
-    int cursor = keyPos + pattern.length();
-    // Salta spazi ed eventuali due punti prima del valore.
-    while (cursor < (int)payload.length() && (payload[cursor] == ' ' || payload[cursor] == ':')) cursor++;
-    if (cursor >= (int)payload.length() || payload[cursor] != '"') return "";
-    int valStart = cursor + 1;
-    int valEnd = payload.indexOf("\"", valStart);
-    if (valEnd == -1) return "";
-    return payload.substring(valStart, valEnd);
-}
-
-// Estrae il valore di una chiave numerica JSON non tra virgolette, es. "expires_in":3600
-// (tollerante a spazi dopo i due punti).
-long extractJsonLong(const String& payload, const String& key, long defaultValue) {
-    String pattern = "\"" + key + "\"";
-    int keyPos = payload.indexOf(pattern);
-    if (keyPos == -1) return defaultValue;
-    int cursor = keyPos + pattern.length();
-    while (cursor < (int)payload.length() && (payload[cursor] == ' ' || payload[cursor] == ':')) cursor++;
-    int valStart = cursor;
-    int valEnd = valStart;
-    while (valEnd < (int)payload.length() && isDigit(payload[valEnd])) valEnd++;
-    if (valEnd == valStart) return defaultValue;
-    return payload.substring(valStart, valEnd).toInt();
-}
-
-// URL-encode minimale per i parametri form-urlencoded del token endpoint OAuth2.
-String daikinUrlEncode(const String& value) {
-    String encoded = "";
-    char buf[4];
-    for (size_t i = 0; i < value.length(); i++) {
-        char c = value.charAt(i);
-        if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            encoded += c;
-        } else {
-            snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
-            encoded += buf;
-        }
-    }
-    return encoded;
-}
-
-float extractJsonNumberAfter(const String& payload, const String& key, int startIndex, float defaultValue) {
-    int keyPos = payload.indexOf(key, startIndex);
-    if (keyPos == -1) return defaultValue;
-    int valuePos = payload.indexOf("\"value\"", keyPos);
-    if (valuePos == -1) return defaultValue;
-    int colon = payload.indexOf(':', valuePos);
-    if (colon == -1) return defaultValue;
-    int cursor = colon + 1;
-    while (cursor < (int)payload.length() && (payload[cursor] == ' ' || payload[cursor] == '\n' || payload[cursor] == '\r' || payload[cursor] == '\t')) cursor++;
-    int end = cursor;
-    bool seenDot = false;
-    if (end < (int)payload.length() && (payload[end] == '-' || payload[end] == '+')) end++;
-    while (end < (int)payload.length()) {
-        char c = payload[end];
-        if (c >= '0' && c <= '9') {
-            end++;
-            continue;
-        }
-        if (!seenDot && c == '.') {
-            seenDot = true;
-            end++;
-            continue;
-        }
-        break;
-    }
-    if (end == cursor || (payload[cursor] == '-' && end == cursor + 1)) return defaultValue;
-    return payload.substring(cursor, end).toFloat();
-}
-
-bool fetchDaikinSensoryData() {
-    if (daikinDeviceId == "") return false;
-    if (!daikinEnsureValidAccessToken()) return false;
-    if (WiFi.status() != WL_CONNECTED) return false;
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    String url = "https://api.onecta.daikineurope.com/v1/gateway-devices/" + daikinDeviceId + "/management-points/" + String(DAIKIN_MANAGEMENT_POINT);
-    if (!http.begin(client, url)) {
-        Serial.println("Daikin: impossibile aprire la connessione all'API per i dati sensoriali.");
-        return false;
-    }
-    http.addHeader("Authorization", "Bearer " + daikinAccessToken);
-    http.addHeader("Accept", "application/json");
-    http.setTimeout(15000);
-
-    int httpCode = http.GET();
-    if (httpCode <= 0) {
-        Serial.printf("Daikin: errore GET client %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
-        http.end();
-        return false;
-    }
-    if (httpCode != HTTP_CODE_OK) {
-        String payload = http.getString();
-        Serial.printf("Daikin: errore GET status %d: %s\n", httpCode, payload.c_str());
-        http.end();
-        return false;
-    }
-
-    String payload = http.getString();
-    http.end();
-
-    int sensoryPos = payload.indexOf("\"sensoryData\"");
-    if (sensoryPos == -1) {
-        Serial.println("Daikin: sensoryData non trovata nella risposta.");
-        return false;
-    }
-
-    float outdoorTemp = extractJsonNumberAfter(payload, "\"outdoorTemperature\"", sensoryPos, NAN);
-    float indoorTemp = extractJsonNumberAfter(payload, "\"roomTemperature\"", sensoryPos, NAN);
-    float indoorHumidity = extractJsonNumberAfter(payload, "\"roomHumidity\"", sensoryPos, NAN);
-
-    if (!isnan(outdoorTemp)) {
-        daikinOutdoorTemperature = outdoorTemp;
-    }
-    if (!isnan(indoorTemp)) {
-        daikinIndoorTemperature = indoorTemp;
-    }
-    if (indoorHumidity >= 0) {
-        daikinIndoorHumidity = (int)indoorHumidity;
-    }
-    daikinStatusAvailable = true;
-    return true;
-}
-
-// Persiste su NVS (cifrati come le altre credenziali) l'access/refresh token correnti,
-// così sopravvivono al deep sleep e ai riavvii senza dover rifare il login.
-void saveDaikinTokens() {
-    preferences.begin("epaper", false);
-    // Non memorizziamo l'access token completo su NVS: basta il refresh token.
-    // Questo evita errori di NVS NOT_ENOUGH_SPACE con token molto lunghi.
-    preferences.remove("daikin_atok");
-    preferences.putString("daikin_rtok", encryptConfig(daikinRefreshToken));
-    preferences.putLong("daikin_texp", daikinTokenExpiresAt);
-    preferences.end();
-}
-
-// POST condiviso verso il token endpoint OAuth2 (usato sia per il refresh che, in
-// teoria, per un futuro exchange authorization_code fatto direttamente dal device).
-bool daikinRequestToken(const String& body) {
-    if (WiFi.status() != WL_CONNECTED) return false;
-
-    WiFiClientSecure client;
-    // NOTA SICUREZZA: setInsecure() salta la verifica del certificato TLS. Per una
-    // verifica completa sostituire con client.setCACert(...) usando il certificato
-    // radice di idp.onecta.daikineurope.com (es. ISRG Root X1 / Let's Encrypt).
-    client.setInsecure();
-
-    HTTPClient http;
-    if (!http.begin(client, "https://idp.onecta.daikineurope.com/v1/oidc/token")) {
-        Serial.println("Daikin: impossibile aprire la connessione al token endpoint.");
-        return false;
-    }
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.setTimeout(15000);
-
-    int httpCode = http.POST(body);
-    String payload = http.getString();
-    http.end();
-
-    if (httpCode != 200) {
-        Serial.printf("Daikin: richiesta token fallita (HTTP %d): %s\n", httpCode, payload.c_str());
-        return false;
-    }
-
-    // Log completo della risposta: utile per diagnosticare eventuali cambi di formato
-    // dell'API. IMPORTANTE: l'API Daikin usa refresh token "rotanti" e monouso, cioè
-    // ogni refresh riuscito lato server invalida il refresh token precedente anche se
-    // qui non riuscissimo a leggerlo correttamente. Per questo logghiamo sempre tutto.
-    Serial.println("Daikin: risposta token endpoint: " + payload);
-
-    String newAccessToken = extractJsonString(payload, "access_token");
-    if (newAccessToken == "") {
-        Serial.println("Daikin: risposta token senza access_token (vedi payload sopra per capire perché).");
-        return false;
-    }
-    daikinAccessToken = newAccessToken;
-
-    // Non tutti i refresh restituiscono un nuovo refresh_token: se assente si mantiene
-    // quello già salvato (stesso comportamento del client CLI di riferimento).
-    String newRefreshToken = extractJsonString(payload, "refresh_token");
-    if (newRefreshToken != "") daikinRefreshToken = newRefreshToken;
-
-    long expiresIn = extractJsonLong(payload, "expires_in", 3600);
-    daikinTokenExpiresAt = (long)time(nullptr) + expiresIn - 60; // 60s di margine di sicurezza
-
-    saveDaikinTokens();
-    return true;
-}
-
-// Rinnova l'access token usando il refresh token salvato. Se manca (o non è più valido,
-// es. revocato), va rifatto il login OAuth2 col tool CLI e reincollato il nuovo token
-// nella pagina di configurazione web del display.
-bool daikinRefreshAccessToken() {
-    if (daikinRefreshToken == "" || daikinClientId == "" || daikinClientSecret == "") {
-        Serial.println("Daikin: refresh_token, client_id o client_secret mancanti. Rifare il login con il tool CLI (github.com/iginoc/daikin).");
-        return false;
-    }
-
-    String body = "grant_type=refresh_token";
-    body += "&refresh_token=" + daikinUrlEncode(daikinRefreshToken);
-    body += "&client_id=" + daikinUrlEncode(daikinClientId);
-    body += "&client_secret=" + daikinUrlEncode(daikinClientSecret);
-
-    return daikinRequestToken(body);
-}
-
-// Garantisce un access token valido, rinnovandolo solo se scaduto o vicino a scadere,
-// per non sprecare inutilmente le richieste giornaliere concesse dall'API Daikin.
-bool daikinEnsureValidAccessToken() {
-    if (daikinAccessToken != "" && (long)time(nullptr) < daikinTokenExpiresAt) {
-        return true; // token ancora valido
-    }
-    return daikinRefreshAccessToken();
-}
-
-// Invia un comando PATCH a una "characteristic" del management point del climatizzatore
-// (es. onOffMode, operationMode, temperatureControl), come in daikin_client.cpp::patchDeviceValue.
-bool daikinPatchCharacteristic(const String& characteristic, const String& jsonBody) {
-    if (daikinDeviceId == "") {
-        Serial.println("Daikin: device_id non configurato (recuperabile col tool CLI, es. lista dispositivi).");
-        return false;
-    }
-    if (!daikinEnsureValidAccessToken()) return false;
-    if (WiFi.status() != WL_CONNECTED) return false;
-
-    String url = "https://api.onecta.daikineurope.com/v1/gateway-devices/" + daikinDeviceId +
-                 "/management-points/" + String(DAIKIN_MANAGEMENT_POINT) +
-                 "/characteristics/" + characteristic;
-
-    WiFiClientSecure client;
-    client.setInsecure(); // vedi nota su daikinRequestToken() riguardo alla verifica TLS
-    HTTPClient http;
-    if (!http.begin(client, url)) {
-        Serial.println("Daikin: impossibile aprire la connessione all'API.");
-        return false;
-    }
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", "Bearer " + daikinAccessToken);
-    http.setTimeout(15000);
-
-    int httpCode = http.PATCH(jsonBody);
-    String payload = http.getString();
-    http.end();
-
-    if (httpCode == 429) {
-        Serial.println("Daikin: limite di 200 richieste/giorno raggiunto. Riprova più tardi.");
-        return false;
-    }
-    if (httpCode != 204 && httpCode != 200) {
-        Serial.printf("Daikin: errore PATCH %s (HTTP %d): %s\n", characteristic.c_str(), httpCode, payload.c_str());
-        return false;
-    }
-    return true;
-}
-
-// Accende/spegne il climatizzatore (chiamata dal pulsante "CLIMA" della griglia).
-void toggleDaikinClima(bool on) {
-  showBusyIndicator();
-  if (daikinRefreshToken == "" || daikinDeviceId == "" || daikinClientId == "" || daikinClientSecret == "") {
-      Serial.println("Daikin config incompleta: client_id, client_secret, refresh_token o device_id mancanti.");
-      hideBusyIndicator();
-      return;
-  }
-
-  String jsonBody = "{\"value\":\"" + String(on ? "on" : "off") + "\"}";
-  bool ok = daikinPatchCharacteristic("onOffMode", jsonBody);
-  Serial.printf("Daikin: CLIMA %s -> %s\n", on ? "ON" : "OFF", ok ? "OK" : "ERRORE");
-  hideBusyIndicator();
-}
-
-// Cambia la modalità operativa: "fanOnly", "heating", "cooling", "auto", "dry".
-// IMPORTANTE: la temperatura impostata con daikinSetTargetTemperature() deve usare la
-// STESSA modalità qui impostata, altrimenti l'unità la ignora silenziosamente.
-bool daikinSetOperationMode(const String& mode) {
-    return daikinPatchCharacteristic("operationMode", "{\"value\":\"" + mode + "\"}");
-}
-
-// Cambia la temperatura target per una specifica modalità operativa. Il valore deve
-// rispettare i vincoli min/max/step dell'unità (leggibili da /gateway-devices).
-bool daikinSetTargetTemperature(const String& operationMode, float temperature) {
-    String path = "/operationModes/" + operationMode + "/setpoints/roomTemperature";
-    String jsonBody = "{\"value\":" + String(temperature, 1) + ",\"path\":\"" + path + "\"}";
-    return daikinPatchCharacteristic("temperatureControl", jsonBody);
-}
 
 void toggleWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -800,18 +462,14 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
       else if (pageVal == 4) newPage = 0; // SENSORI
 
       if (newPage != -1 && newPage != currentPage) {
-        // Se siamo in una pagina di controllo (luce, media) e HA ci rimanda alla pagina "genitore", ignoriamo
-        if ((currentPage == LIGHT_CONTROL_PAGE && newPage == 2) || (currentPage == MEDIA_CONTROL_PAGE && newPage == 1)) {
+        // Se siamo in una pagina di controllo (luce) e HA ci rimanda alla pagina "genitore", ignoriamo
+        if (currentPage == LIGHT_CONTROL_PAGE && newPage == 2) {
             // Ignora il cambio pagina
         } else {
         Serial.printf("Changing page from %d to %d\n", currentPage, newPage);
         currentPage = newPage;
         pageChanged = true;
-        if (currentPage == 3) {
-            loadGroupSwitches(); // Ora recupera anche lo stato, non serve updateStates
-        } else if (currentPage == 2) {
-            loadGroupLights(); // Ora recupera anche lo stato, non serve updateStates
-        } else if (currentPage == 1) {
+        if (currentPage == 1) {
            // Pulisci e configura solo i pulsanti per la pagina HOME
            for (int k = 0; k < NUM_GRID_BUTTONS; k++) {
                gridButtons[k].entity_id = "";
@@ -825,17 +483,9 @@ bool updateStates(bool update_devices = true, bool update_sensors = true, bool s
            wifi_mode_t mode = WiFi.getMode();
            gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
            gridButtons[1].entity_id = "";
-           gridButtons[1].name = "Script";
-           gridButtons[1].type = "script_page";
+           gridButtons[1].name = "SCACCHI";
+           gridButtons[1].type = "chess_page";
            gridButtons[1].state = "off";
-           gridButtons[2].entity_id = "";
-           gridButtons[2].name = "Media";
-           gridButtons[2].type = "media_page_link";
-           gridButtons[2].state = "off";
-        } else if (currentPage == 0) {
-           loadGroupSensors();
-        } else if (currentPage == SCRIPT_PAGE) {
-           loadGroupScripts();
         }
         }
       }
@@ -1117,26 +767,6 @@ void drawGridButtons() {
     const int rows = 4;
     const int margin_x = 0;
     const int margin_y = 0;
-    const int infoPanelHeight = (currentPage == 3) ? 100 : 0;
-    if (currentPage == 3) {
-        int panelY = header_height + 10;
-        canvas.fillRect(col2_start_x, panelY, col2_width, infoPanelHeight, WHITE);
-        canvas.drawRect(col2_start_x, panelY, col2_width, infoPanelHeight, BLACK);
-        canvas.setFreeFont(&FreeSans12pt7b);
-        canvas.setTextDatum(TL_DATUM);
-        if (daikinStatusAvailable) {
-            canvas.drawString("EST: " + String(daikinOutdoorTemperature, 1) + "\u00b0C", col2_start_x + 10, panelY + 18);
-            canvas.drawString("INT: " + String(daikinIndoorTemperature, 1) + "\u00b0C", col2_start_x + 10, panelY + 40);
-            canvas.drawString("UMID: " + String(daikinIndoorHumidity) + " %", col2_start_x + 10, panelY + 62);
-            canvas.drawString("Daikin status", col2_start_x + 10, panelY + 84);
-        } else {
-            canvas.drawString("Daikin dati non disponibili", col2_start_x + 10, panelY + 34);
-            canvas.drawString("Controlla configurazione o WiFi.", col2_start_x + 10, panelY + 58);
-        }
-    }
-    if (currentPage == 3) {
-        start_y += infoPanelHeight;
-    }
 
     const int btn_w = col2_width / cols;
     const int btn_h = (M5EPD_PANEL_H - start_y) / rows;
@@ -1186,181 +816,6 @@ void drawGridButtons() {
     }
 }
 
-void loadGroupLights() {
-  if (homeAssistantAddress == "") return;
-  showBusyIndicator();
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  WiFiClient client;
-  String apiUrl = homeAssistantAddress + "/api/template";
-  
-  // Template per ottenere entity_id, friendly_name e state separati da | e coppie separate da ;
-  String templateBody = "{% set entities = state_attr('light.gruppo_luci', 'entity_id') %}{% if entities %}{% for entity in entities %}{{ entity }}|{{ state_attr(entity, 'friendly_name') }}|{{ states(entity) }}{% if not loop.last %};{% endif %}{% endfor %}{% endif %}";
-  String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
-
-  http.begin(client, apiUrl);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpResponseCode = http.POST(jsonPayload);
-  if (httpResponseCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    
-    // Pulisci i pulsanti
-    for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
-        gridButtons[i].entity_id = "";
-        gridButtons[i].name = "";
-        gridButtons[i].type = "";
-        gridButtons[i].state = "off";
-    }
-
-    int startIndex = 0;
-    int btnIndex = 0;
-    while (startIndex < payload.length() && btnIndex < NUM_GRID_BUTTONS) {
-        int endIndex = payload.indexOf(';', startIndex);
-        if (endIndex == -1) endIndex = payload.length();
-        
-        String triplet = payload.substring(startIndex, endIndex);
-        int firstPipe = triplet.indexOf('|');
-        int secondPipe = triplet.indexOf('|', firstPipe + 1);
-
-        if (firstPipe != -1 && secondPipe != -1) {
-            gridButtons[btnIndex].entity_id = triplet.substring(0, firstPipe);
-            gridButtons[btnIndex].name = triplet.substring(firstPipe + 1, secondPipe);
-            gridButtons[btnIndex].type = "light"; 
-            gridButtons[btnIndex].state = triplet.substring(secondPipe + 1);
-            btnIndex++;
-        }
-        startIndex = endIndex + 1;
-    }
-
-  }
-  http.end();
-  hideBusyIndicator();
-}
-
-void loadGroupSwitches() {
-  // Pulisci i pulsanti in modo da non lasciare elementi della pagina HOME
-  for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
-      gridButtons[i].entity_id = "";
-      gridButtons[i].name = "";
-      gridButtons[i].type = "";
-      gridButtons[i].state = "off";
-  }
-
-  bool canFetchSwitches = (homeAssistantAddress != "" && WiFi.status() == WL_CONNECTED);
-  if (canFetchSwitches) {
-    showBusyIndicator();
-    HTTPClient http;
-    WiFiClient client;
-    String apiUrl = homeAssistantAddress + "/api/template";
-    
-    // Template per ottenere entity_id, friendly_name e state separati da | e coppie separate da ;
-    String templateBody = "{% set entities = state_attr('switch.gruppo_switch', 'entity_id') %}{% if entities %}{% for entity in entities %}{{ entity }}|{{ state_attr(entity, 'friendly_name') }}|{{ states(entity) }}{% if not loop.last %};{% endif %}{% endfor %}{% endif %}";
-    String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
-
-    http.begin(client, apiUrl);
-    http.addHeader("Content-Type", "application/json");
-
-    int httpResponseCode = http.POST(jsonPayload);
-    if (httpResponseCode == HTTP_CODE_OK) {
-      String payload = http.getString();
-
-      int startIndex = 0;
-      int btnIndex = 0;
-      const int maxSwitchButtons = NUM_GRID_BUTTONS - 2; // riserva due slot per i comandi CLIMA
-      while (startIndex < payload.length() && btnIndex < maxSwitchButtons) {
-          int endIndex = payload.indexOf(';', startIndex);
-          if (endIndex == -1) endIndex = payload.length();
-          
-          String triplet = payload.substring(startIndex, endIndex);
-          int firstPipe = triplet.indexOf('|');
-          int secondPipe = triplet.indexOf('|', firstPipe + 1);
-
-          if (firstPipe != -1 && secondPipe != -1) {
-              gridButtons[btnIndex].entity_id = triplet.substring(0, firstPipe);
-              gridButtons[btnIndex].name = triplet.substring(firstPipe + 1, secondPipe);
-              gridButtons[btnIndex].type = "switch"; 
-              gridButtons[btnIndex].state = triplet.substring(secondPipe + 1);
-              btnIndex++;
-          }
-          startIndex = endIndex + 1;
-      }
-    }
-    http.end();
-    hideBusyIndicator();
-  }
-
-  daikinStatusAvailable = false;
-  if (WiFi.status() == WL_CONNECTED && daikinDeviceId != "") {
-      fetchDaikinSensoryData();
-  }
-
-  // Assicura che i pulsanti CLIMA compaiano sempre.
-  if (NUM_GRID_BUTTONS >= 2) {
-      gridButtons[NUM_GRID_BUTTONS - 2].entity_id = "";
-      gridButtons[NUM_GRID_BUTTONS - 2].name = "CLIMA ON";
-      gridButtons[NUM_GRID_BUTTONS - 2].type = "daikin_clima";
-      gridButtons[NUM_GRID_BUTTONS - 2].state = "off";
-
-      gridButtons[NUM_GRID_BUTTONS - 1].entity_id = "";
-      gridButtons[NUM_GRID_BUTTONS - 1].name = "CLIMA OFF";
-      gridButtons[NUM_GRID_BUTTONS - 1].type = "daikin_clima";
-      gridButtons[NUM_GRID_BUTTONS - 1].state = "off";
-  }
-}
-
-void loadGroupScripts() {
-  if (homeAssistantAddress == "") return;
-  showBusyIndicator();
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  WiFiClient client;
-  String apiUrl = homeAssistantAddress + "/api/template";
-  
-  // Template per ottenere tutti gli script
-  String templateBody = "{% for state in states.script %}{{ state.entity_id }}|{{ state.name }}|{{ state.state }}{% if not loop.last %};{% endif %}{% endfor %}";
-  String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
-
-  http.begin(client, apiUrl);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpResponseCode = http.POST(jsonPayload);
-  if (httpResponseCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    
-    // Pulisci i pulsanti
-    for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
-        gridButtons[i].entity_id = "";
-        gridButtons[i].name = "";
-        gridButtons[i].type = "";
-        gridButtons[i].state = "off";
-    }
-
-    int startIndex = 0;
-    int btnIndex = 0;
-    while (startIndex < payload.length() && btnIndex < NUM_GRID_BUTTONS) {
-        int endIndex = payload.indexOf(';', startIndex);
-        if (endIndex == -1) endIndex = payload.length();
-        
-        String triplet = payload.substring(startIndex, endIndex);
-        int firstPipe = triplet.indexOf('|');
-        int secondPipe = triplet.indexOf('|', firstPipe + 1);
-
-        if (firstPipe != -1 && secondPipe != -1) {
-            gridButtons[btnIndex].entity_id = triplet.substring(0, firstPipe);
-            gridButtons[btnIndex].name = triplet.substring(firstPipe + 1, secondPipe);
-            gridButtons[btnIndex].type = "script"; 
-            gridButtons[btnIndex].state = triplet.substring(secondPipe + 1);
-            btnIndex++;
-        }
-        startIndex = endIndex + 1;
-    }
-  }
-  http.end();
-  hideBusyIndicator();
-}
 
 void fetchLightDetails(String entity_id) {
     if (homeAssistantAddress == "") return;
@@ -1675,62 +1130,80 @@ void drawAnalogClock() {
     canvas.fillCircle(cx, cy, 5, BLACK);
 }
 
-void loadGroupSensors() {
-  if (homeAssistantAddress == "") return;
-  showBusyIndicator();
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  // Preserva gli stati esistenti per evitare "N/A" durante il cambio pagina
-  String timeState = getSensorState("sensor.time");
-  String dateState = getSensorState("sensor.oggi");
-  String pageState = getSensorState("input_number.epaper_pagina");
-
-  if (timeState == "") timeState = "N/A";
-  if (dateState == "") dateState = "N/A";
-  if (pageState == "") pageState = "0";
-
-  // Reset sensors vector to default system sensors
-  sensors.clear();
-  sensors.push_back({"sensor.time", "Time", "", timeState});
-  sensors.push_back({"sensor.oggi", "Oggi", "", dateState});
-  sensors.push_back({"input_number.epaper_pagina", "Pagina", "", pageState});
-
-  HTTPClient http;
-  WiFiClient client;
-  String apiUrl = homeAssistantAddress + "/api/template";
-  
-  // Template per ottenere entity_id, friendly_name e state
-  String templateBody = "{% set entities = state_attr('sensor.gruppo_sensori', 'entity_id') %}{% if entities %}{% for entity in entities %}{{ entity }}|{{ state_attr(entity, 'friendly_name') }}|{{ states(entity) }}{% if not loop.last %};{% endif %}{% endfor %}{% endif %}";
-  String jsonPayload = "{\"template\":\"" + templateBody + "\"}";
-
-  http.begin(client, apiUrl);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpResponseCode = http.POST(jsonPayload);
-  if (httpResponseCode == HTTP_CODE_OK) {
-    String payload = http.getString();
+void drawChessBoard() {
+    const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22; // 266
+    const int col2_width = M5EPD_PANEL_W - col2_start_x; // 694
     
-    int startIndex = 0;
-    while (startIndex < payload.length()) {
-        int endIndex = payload.indexOf(';', startIndex);
-        if (endIndex == -1) endIndex = payload.length();
-        
-        String triplet = payload.substring(startIndex, endIndex);
-        int firstPipe = triplet.indexOf('|');
-        int secondPipe = triplet.indexOf('|', firstPipe + 1);
+    // Chessboard is centered in the right part of the screen
+    int board_w = 480;
+    int board_h = 480;
+    int cell_w = 60;
+    int cell_h = 60;
+    int board_x = col2_start_x + (col2_width - board_w) / 2; // 373
+    int board_y = (M5EPD_PANEL_H - board_h) / 2; // 30
 
-        if (firstPipe != -1 && secondPipe != -1) {
-            String entity_id = triplet.substring(0, firstPipe);
-            String name = triplet.substring(firstPipe + 1, secondPipe);
-            String state = triplet.substring(secondPipe + 1);
+    // Clear only the right part of the screen
+    canvas.fillRect(col2_start_x, 0, col2_width, M5EPD_PANEL_H, WHITE);
+
+    // Draw Chessboard background / grid
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            int x = board_x + c * cell_w;
+            int y = board_y + r * cell_h;
             
-            sensors.push_back({entity_id, name, "", state});
+            // Alternating square colors (EPD levels 0-15: 15 is white, 12 is light gray)
+            uint16_t color = ((r + c) % 2 == 0) ? 15 : 12;
+            canvas.fillRect(x, y, cell_w, cell_h, color);
+            canvas.drawRect(x, y, cell_w, cell_h, 0); // Black border
+            
+            // Highlight selected square
+            if (r == chessSelectedY && c == chessSelectedX) {
+                // Draw a thick black border inside the selected square
+                canvas.drawRect(x + 1, y + 1, cell_w - 2, cell_h - 2, 0);
+                canvas.drawRect(x + 2, y + 2, cell_w - 4, cell_h - 4, 0);
+                canvas.drawRect(x + 3, y + 3, cell_w - 6, cell_h - 6, 0);
+            }
+
+            char piece = chessBoard[r][c];
+            if (piece != '.') {
+                int cx = x + cell_w / 2;
+                int cy = y + cell_h / 2;
+                int radius = 24; // 24 pixels radius (fits inside 60px cell)
+                
+                // Determine if it's white or black piece
+                bool isWhitePiece = (piece >= 'A' && piece <= 'Z');
+                char pieceLetter = isWhitePiece ? piece : (piece - 'a' + 'A');
+
+                if (isWhitePiece) {
+                    // White piece: white circle with black outline and black text
+                    canvas.fillCircle(cx, cy, radius, 15);
+                    canvas.drawCircle(cx, cy, radius, 0);
+                    canvas.setTextColor(0); // Black
+                } else {
+                    // Black piece: black circle with white text
+                    canvas.fillCircle(cx, cy, radius, 0);
+                    canvas.setTextColor(15); // White
+                }
+                
+                canvas.setTextDatum(MC_DATUM);
+                canvas.setFreeFont(&FreeSansBold18pt7b);
+                char str[2] = { pieceLetter, '\0' };
+                canvas.drawString(str, cx, cy);
+            }
         }
-        startIndex = endIndex + 1;
     }
-  }
-  http.end();
-  hideBusyIndicator();
+
+    // Draw RESET button to the right of the board
+    int btn_w = 90;
+    int btn_h = 50;
+    int reset_btn_x = 860;
+    int reset_btn_y = (M5EPD_PANEL_H - btn_h) / 2;
+
+    canvas.fillRect(reset_btn_x, reset_btn_y, btn_w, btn_h, 0); // black button
+    canvas.setTextColor(15); // white text
+    canvas.setFreeFont(&FreeSansBold12pt7b);
+    canvas.setTextDatum(MC_DATUM);
+    canvas.drawString("RESET", reset_btn_x + btn_w / 2, reset_btn_y + btn_h / 2);
 }
 
 void showBusyIndicator() {
@@ -1985,18 +1458,6 @@ void handleWifiConfig() {
     html += "<label>Password:</label><br>";
     html += "<input type='password' name='mqtt_password' value='" + mqtt_password + "'><br>";
 
-    html += "<h3>Daikin OneCTA</h3>";
-    html += "<label>Client ID:</label><br>";
-    html += "<input type='text' name='daikin_client_id' value='" + daikinClientId + "'><br>";
-    html += "<label>Client Secret:</label><br>";
-    html += "<input type='password' name='daikin_client_secret' value='" + daikinClientSecret + "'><br>";
-    html += "<label>Redirect URI:</label><br>";
-    html += "<input type='text' name='daikin_redirect_uri' value='" + daikinRedirectUri + "'><br>";
-    html += "<label>Device ID (dal tool CLI 'daikin'):</label><br>";
-    html += "<input type='text' name='daikin_device_id' value='" + daikinDeviceId + "'><br>";
-    html += "<label>Refresh Token (login una tantum col tool CLI):</label><br>";
-    html += "<input type='password' name='daikin_refresh_token' value='" + daikinRefreshToken + "' placeholder='incolla qui il refresh_token ottenuto col tool CLI'><br>";
-
     html += "<h3>Risparmio Energetico</h3>";
     html += "<label>Deep Sleep:</label><br>";
     html += "<select name='ds_enabled'>";
@@ -2028,18 +1489,6 @@ void handleSaveWifi() {
         if (server.hasArg("mqtt_port")) preferences.putInt("mqtt_port", server.arg("mqtt_port").toInt());
         if (server.hasArg("mqtt_user")) preferences.putString("mqtt_user", encryptConfig(server.arg("mqtt_user")));
         if (server.hasArg("mqtt_password")) preferences.putString("mqtt_password", encryptConfig(server.arg("mqtt_password")));
-
-        if (server.hasArg("daikin_client_id")) preferences.putString("daikin_cid", encryptConfig(server.arg("daikin_client_id")));
-        if (server.hasArg("daikin_client_secret")) preferences.putString("daikin_csec", encryptConfig(server.arg("daikin_client_secret")));
-        if (server.hasArg("daikin_redirect_uri")) preferences.putString("daikin_ruri", encryptConfig(server.arg("daikin_redirect_uri")));
-        if (server.hasArg("daikin_device_id")) preferences.putString("daikin_devid", encryptConfig(server.arg("daikin_device_id")));
-        if (server.hasArg("daikin_refresh_token") && server.arg("daikin_refresh_token") != "") {
-            // Un nuovo refresh_token incollato manualmente invalida l'access token corrente,
-            // così al prossimo comando viene subito richiesto un nuovo access token coerente.
-            preferences.putString("daikin_rtok", encryptConfig(server.arg("daikin_refresh_token")));
-            preferences.remove("daikin_atok");
-            preferences.putLong("daikin_texp", 0);
-        }
 
         if (server.hasArg("ds_enabled")) preferences.putBool("ds_enabled", server.arg("ds_enabled").toInt());
         if (server.hasArg("ds_timeout")) preferences.putULong("ds_timeout", server.arg("ds_timeout").toInt());
@@ -2074,13 +1523,6 @@ void handleSetPage() {
         int page = server.arg("page").toInt();
         if (page >= 0 && page <= 3) {
             currentPage = page;
-            if (currentPage == 3) {
-                loadGroupSwitches();
-            } else if (currentPage == 2) {
-                loadGroupLights();
-            } else if (currentPage == 0) {
-                loadGroupSensors();
-            }
             drawFullUI(false);
         }
         server.sendHeader("Location", "/");
@@ -2146,15 +1588,6 @@ void setup() {
   mqtt_port = preferences.getInt("mqtt_port", mqtt_port);
   mqtt_user = decryptConfig(preferences.getString("mqtt_user", mqtt_user));
   mqtt_password = decryptConfig(preferences.getString("mqtt_password", mqtt_password));
-
-  daikinClientId = decryptConfig(preferences.getString("daikin_cid", daikinClientId));
-  daikinClientSecret = decryptConfig(preferences.getString("daikin_csec", daikinClientSecret));
-  daikinRedirectUri = decryptConfig(preferences.getString("daikin_ruri", daikinRedirectUri));
-  daikinDeviceId = decryptConfig(preferences.getString("daikin_devid", daikinDeviceId));
-  daikinRefreshToken = decryptConfig(preferences.getString("daikin_rtok", daikinRefreshToken));
-  daikinAccessToken = decryptConfig(preferences.getString("daikin_atok", daikinAccessToken));
-  preferences.remove("daikin_atok");
-  daikinTokenExpiresAt = preferences.getLong("daikin_texp", 0);
 
   // Carica impostazioni Deep Sleep
   deepSleepEnabled = preferences.getBool("ds_enabled", true);
@@ -2223,10 +1656,6 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started");
 
-  if (currentPage == 0) {
-      loadGroupSensors();
-  }
-
   // --- IMPOSTAZIONI MQTT ---
   // Impostazioni MQTT
   mqttClient.setServer(mqtt_server.c_str(), mqtt_port);
@@ -2242,7 +1671,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println("Message arrived on topic: " + topicStr);
 
   // Se arriva un messaggio sul topic di aggiornamento, ridisegna tutto (tranne pagine speciali).
-  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE && currentPage != LOG_PAGE) {
+  if (topicStr == "m5paper/update" && currentPage != GRAPH_PAGE && currentPage != CALENDAR_PAGE && currentPage != CHESS_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE && currentPage != LOG_PAGE) {
     Serial.println("Update command received via MQTT. Refreshing screen...");
     // CORREZIONE: Esegui un aggiornamento parziale invece di un refresh completo.
     updateStates(true, true); // Ottieni i nuovi stati
@@ -2373,41 +1802,46 @@ void drawFullUI(bool syncPage) {
   // La cornice è stata rimossa.
   canvas.setTextColor(BLACK); // Testo nero
 
-  drawHeader();
-  drawButtons();
-  if (currentPage == 0) drawSensors(); 
-  else if (currentPage == CLOCK_PAGE) drawAnalogClock(); // Existing logic
-  else if (currentPage == APPOINTMENTS_PAGE) drawAppointmentsPage(); // New logic for appointments
-  else if (currentPage == WEEK_VIEW_PAGE) drawWeekView();
-  else if (currentPage == LOG_PAGE) drawLogPage();
-  else {
-      if (currentPage == 1) {
-          gridButtons[0].entity_id = "";
-          gridButtons[0].name = "Hotspot";
-          gridButtons[0].type = "hotspot";
-          wifi_mode_t mode = WiFi.getMode();
-          gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
-           gridButtons[1].entity_id = "";
-           gridButtons[1].name = "Script";
-           gridButtons[1].type = "script_page";
-           gridButtons[1].state = "off";
-           gridButtons[2].entity_id = "";
-           gridButtons[2].name = "Media";
-           gridButtons[2].type = "media_page_link";
-           gridButtons[2].state = "off";
-           gridButtons[3].entity_id = "";
-           gridButtons[3].name = "Log";
-           gridButtons[3].type = "log_page_link";
-           gridButtons[3].state = "off";
-           gridButtons[3].entity_id = "";
-           gridButtons[3].name = "Log";
-           gridButtons[3].type = "log_page_link";
-           gridButtons[3].state = "off";
-           for (int k = 4; k < NUM_GRID_BUTTONS; k++) {
-               gridButtons[k].name = "";
-           }
+  if (currentPage == CHESS_PAGE) {
+      drawButtons();
+      drawChessBoard();
+  } else {
+      drawHeader();
+      drawButtons();
+      if (currentPage == 0) drawSensors(); 
+      else if (currentPage == CLOCK_PAGE) drawAnalogClock(); // Existing logic
+      else if (currentPage == APPOINTMENTS_PAGE) drawAppointmentsPage(); // New logic for appointments
+      else if (currentPage == WEEK_VIEW_PAGE) drawWeekView();
+      else if (currentPage == LOG_PAGE) drawLogPage();
+      else {
+          if (currentPage == 1) {
+              gridButtons[0].entity_id = "";
+              gridButtons[0].name = "Hotspot";
+              gridButtons[0].type = "hotspot";
+              wifi_mode_t mode = WiFi.getMode();
+              gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
+               gridButtons[1].entity_id = "";
+               gridButtons[1].name = "SCACCHI";
+               gridButtons[1].type = "chess_page";
+               gridButtons[1].state = "off";
+               gridButtons[2].entity_id = "";
+               gridButtons[2].name = "";
+               gridButtons[2].type = "";
+               gridButtons[2].state = "off";
+               gridButtons[3].entity_id = "";
+               gridButtons[3].name = "Log";
+               gridButtons[3].type = "log_page_link";
+               gridButtons[3].state = "off";
+               gridButtons[3].entity_id = "";
+               gridButtons[3].name = "Log";
+               gridButtons[3].type = "log_page_link";
+               gridButtons[3].state = "off";
+               for (int k = 4; k < NUM_GRID_BUTTONS; k++) {
+                   gridButtons[k].name = "";
+               }
+          }
+          drawGridButtons();
       }
-      drawGridButtons();
   }
 
   canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
@@ -2849,7 +2283,7 @@ void loop() {
   if (millis() - lastUpdate > UPDATE_INTERVAL) {
       lastUpdate = millis();
       // Non aggiornare se siamo in pagine speciali (controllo, grafico, musica, ecc.)
-      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE && currentPage != LOG_PAGE) {
+      if (WiFi.status() == WL_CONNECTED && currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CLOCK_PAGE && currentPage != CALENDAR_PAGE && currentPage != CHESS_PAGE && currentPage != APPOINTMENTS_PAGE && currentPage != WEEK_VIEW_PAGE && currentPage != LOG_PAGE) {
           // Se updateStates ritorna true, significa che la pagina è cambiata
           bool pageChanged = updateStates(true, true);
           if (pageChanged) {
@@ -2884,7 +2318,7 @@ void loop() {
           drawHeader();
           drawAnalogClock();
           canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-      } else if (currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CALENDAR_PAGE && currentPage != MEDIA_CONTROL_PAGE && currentPage != SCRIPT_PAGE && currentPage != LOG_PAGE) {
+      } else if (currentPage != GRAPH_PAGE && currentPage != LIGHT_CONTROL_PAGE && currentPage != CALENDAR_PAGE && currentPage != CHESS_PAGE && currentPage != LOG_PAGE) {
           M5EPD_Canvas headerCanvas(&M5.EPD);
           headerCanvas.createCanvas(M5EPD_PANEL_W, 80);
           drawHeader(&headerCanvas);
@@ -3016,7 +2450,6 @@ void loop() {
           if (i == 0) { // SWITCH
               currentPage = 3;
               setPageInputNumber(1);
-              loadGroupSwitches();
               canvas.fillRect(0, 0, M5EPD_PANEL_W, M5EPD_PANEL_H, WHITE);
               drawHeader();
               drawButtons();
@@ -3025,7 +2458,6 @@ void loop() {
           } else if (i == 1) { // LUCI
               currentPage = 2;
               setPageInputNumber(2);
-              loadGroupLights();
               drawHeader();
               drawButtons();
               drawGridButtons();
@@ -3045,13 +2477,9 @@ void loop() {
               wifi_mode_t mode = WiFi.getMode();
               gridButtons[0].state = ((mode == WIFI_AP) || (mode == WIFI_AP_STA)) ? "on" : "off";
               gridButtons[1].entity_id = "";
-              gridButtons[1].name = "Script";
-              gridButtons[1].type = "script_page";
+              gridButtons[1].name = "SCACCHI";
+              gridButtons[1].type = "chess_page";
               gridButtons[1].state = "off";
-              gridButtons[2].entity_id = "";
-              gridButtons[2].name = "Media";
-              gridButtons[2].type = "media_page_link";
-              gridButtons[2].state = "off";
               gridButtons[3].entity_id = "";
               gridButtons[3].name = "Log";
               gridButtons[3].type = "log_page_link";
@@ -3064,7 +2492,6 @@ void loop() {
           } else if (i == 3) { // SENSORI
               currentPage = 0;
               setPageInputNumber(4);
-              loadGroupSensors();
               drawHeader();
               drawButtons();
               drawSensors();
@@ -3082,7 +2509,7 @@ void loop() {
       }
 
       // Controlla se il tocco è all'interno di uno dei pulsanti della griglia
-      if (currentPage == 1 || currentPage == 2 || currentPage == 3 || currentPage == SCRIPT_PAGE) {
+      if (currentPage == 1 || currentPage == 2 || currentPage == 3) {
        for (int i = 0; i < NUM_GRID_BUTTONS; i++) {
         if (finger.x >= gridButtons[i].x && finger.x <= (gridButtons[i].x + gridButtons[i].w) &&
             finger.y >= gridButtons[i].y && finger.y <= (gridButtons[i].y + gridButtons[i].h)) {
@@ -3098,15 +2525,6 @@ void loop() {
               fetchLightDetails(selectedLightEntity);
               drawHeader();
               drawLightControlPage();
-              break;
-          } else if (String(gridButtons[i].type) == "media_player") {
-              // Apri pagina controllo media player
-              selectedMediaEntity = gridButtons[i].entity_id;
-              selectedMediaName = gridButtons[i].name;
-              currentPage = MEDIA_CONTROL_PAGE;
-              fetchMediaDetails(selectedMediaEntity);
-              drawHeader();
-              drawMediaControlPage();
               break;
           } else if (String(gridButtons[i].type) == "hotspot") {
                // Gestione Toggle Hotspot
@@ -3124,36 +2542,13 @@ void loop() {
                drawGridButtons();
                canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
                break;
-          } else if (String(gridButtons[i].type) == "script_page") {
-               // Vai alla pagina Script
-               currentPage = SCRIPT_PAGE;
-               loadGroupScripts();
+          } else if (String(gridButtons[i].type) == "chess_page") {
+               // Vai alla pagina Scacchi
+               currentPage = CHESS_PAGE;
                drawHeader();
                drawButtons();
-               drawGridButtons();
-               canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-               break;
-          } else if (String(gridButtons[i].type) == "daikin_clima") {
-               bool turnOn = (gridButtons[i].name == "CLIMA ON");
-               toggleDaikinClima(turnOn);
-               drawHeader();
-               drawGridButtons();
-               canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
-               break;
-          } else if (String(gridButtons[i].type) == "media_page_link") {
-               currentPage = MEDIA_CONTROL_PAGE;
-               if (defaultMediaEntityId != "") {
-                   selectedMediaEntity = defaultMediaEntityId;
-                   fetchMediaDetails(selectedMediaEntity);
-               } else {
-                   // Nessun player predefinito, mostra pagina vuota con messaggio
-                   selectedMediaEntity = "";
-                   selectedMediaName = "Nessun Player";
-                   selectedMediaState = "unavailable";
-                   selectedMediaVolume = 0.0;
-               }
-               drawHeader();
-               drawMediaControlPage();
+               drawChessBoard();
+               canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
                break;
           } else if (String(gridButtons[i].type) == "log_page_link") {
                currentPage = LOG_PAGE;
@@ -3176,6 +2571,82 @@ void loop() {
           }
         }
       }
+      } else if (currentPage == CHESS_PAGE) {
+          const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22; // 266
+          const int col2_width = M5EPD_PANEL_W - col2_start_x; // 694
+          int board_w = 480;
+          int board_h = 480;
+          int cell_w = 60;
+          int cell_h = 60;
+          int board_x = col2_start_x + (col2_width - board_w) / 2; // 373
+          int board_y = (M5EPD_PANEL_H - board_h) / 2; // 30
+
+          // Check if touch is inside the board
+          if (finger.x >= board_x && finger.x < board_x + board_w &&
+              finger.y >= board_y && finger.y < board_y + board_h) {
+              int col = (finger.x - board_x) / cell_w;
+              int row = (finger.y - board_y) / cell_h;
+              
+              if (col >= 0 && col < 8 && row >= 0 && row < 8) {
+                  Serial.printf("Tapped chessboard square: row %d, col %d\n", row, col);
+                  if (chessSelectedX == -1 && chessSelectedY == -1) {
+                      // Selecting a piece
+                      if (chessBoard[row][col] != '.') {
+                          chessSelectedX = col;
+                          chessSelectedY = row;
+                      }
+                  } else {
+                      // Moving piece or deselecting
+                      if (chessSelectedX == col && chessSelectedY == row) {
+                          // Tapped the same square, deselect
+                          chessSelectedX = -1;
+                          chessSelectedY = -1;
+                      } else {
+                          // Move piece to the new square (even if it's capturing an opponent's piece)
+                          chessBoard[row][col] = chessBoard[chessSelectedY][chessSelectedX];
+                          chessBoard[chessSelectedY][chessSelectedX] = '.';
+                          chessSelectedX = -1;
+                          chessSelectedY = -1;
+                      }
+                  }
+                  drawChessBoard();
+                  canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+              }
+              while(!M5.TP.isFingerUp()) { M5.TP.update(); }
+              return;
+          }
+
+          // Check if touch is inside the RESET button
+          int btn_w = 90;
+          int btn_h = 50;
+          int reset_btn_x = 860;
+          int reset_btn_y = (M5EPD_PANEL_H - btn_h) / 2;
+
+          if (finger.x >= reset_btn_x && finger.x < reset_btn_x + btn_w &&
+              finger.y >= reset_btn_y && finger.y < reset_btn_y + btn_h) {
+              Serial.println("Tapped RESET Chess button");
+              char initialBoard[8][8] = {
+                  {'r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'},
+                  {'p', 'p', 'p', 'p', 'p', 'p', 'p', 'p'},
+                  {'.', '.', '.', '.', '.', '.', '.', '.'},
+                  {'.', '.', '.', '.', '.', '.', '.', '.'},
+                  {'.', '.', '.', '.', '.', '.', '.', '.'},
+                  {'.', '.', '.', '.', '.', '.', '.', '.'},
+                  {'P', 'P', 'P', 'P', 'P', 'P', 'P', 'P'},
+                  {'R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'}
+              };
+              for (int r = 0; r < 8; r++) {
+                  for (int c = 0; c < 8; c++) {
+                      chessBoard[r][c] = initialBoard[r][c];
+                  }
+              }
+              chessSelectedX = -1;
+              chessSelectedY = -1;
+              drawChessBoard();
+              canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+              while(!M5.TP.isFingerUp()) { M5.TP.update(); }
+              return;
+          }
       } else if (currentPage == 0) {
           // Gestione paginazione sensori
           int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
@@ -3293,125 +2764,9 @@ void loop() {
               drawLightControlPage();
           }
       }
-      else if (currentPage == MEDIA_CONTROL_PAGE) {
-          const int header_height = 80;
-          const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
-          const int col2_width = M5EPD_PANEL_W - col2_start_x;
-          
-          // Coordinate Pulsanti di controllo
-          int btnY = header_height + 150;
-          int btnW = 100;
-          int btnH = 80;
-          int btnSpacing = (col2_width - (3 * btnW)) / 4;
-          int prevX = col2_start_x + btnSpacing;
-          int playX = prevX + btnW + btnSpacing;
-          int nextX = playX + btnW + btnSpacing;
-
-          // Coordinate Slider Volume
-          int slX = col2_start_x + 40;
-          int slY = btnY + btnH + 80;
-          int slW = col2_width - 80;
-          int slH = 40;
-
-          if (finger.y >= btnY && finger.y <= btnY + btnH) {
-              if (finger.x >= prevX && finger.x <= prevX + btnW) {
-                  controlMediaPlayer(selectedMediaEntity, "media_previous_track");
-              } else if (finger.x >= playX && finger.x <= playX + btnW) {
-                  controlMediaPlayer(selectedMediaEntity, "media_play_pause");
-              } else if (finger.x >= nextX && finger.x <= nextX + btnW) {
-                  controlMediaPlayer(selectedMediaEntity, "media_next_track");
-              }
-              delay(250); // Attendi che HA processi il comando
-              fetchMediaDetails(selectedMediaEntity);
-              drawMediaControlPage();
-
-          } else if (finger.x >= slX && finger.x <= slX + slW && finger.y >= slY - 20 && finger.y <= slY + slH + 20) {
-              // Tocco su Slider
-              float newVol = (float)(finger.x - slX) / (float)slW;
-              if (newVol < 0.0) newVol = 0.0;
-              if (newVol > 1.0) newVol = 1.0;
-              
-              selectedMediaVolume = newVol;
-              
-              setMediaVolume(selectedMediaEntity, selectedMediaVolume);
-              // Ridisegna solo la parte dello slider per reattività
-              drawMediaControlPage(); // Per semplicità ridisegnamo tutto
-          }
-      }
       while(!M5.TP.isFingerUp()) { M5.TP.update(); } // Attendi il rilascio del dito
     }
   }
-}
-
-void fetchMediaDetails(String entity_id) {
-    if (homeAssistantAddress == "" || entity_id == "") return;
-    if (WiFi.status() != WL_CONNECTED) return;
-    HTTPClient http;
-    WiFiClient client;
-    String url = homeAssistantAddress + "/api/states/" + entity_id;
-    http.begin(client, url);
-    int httpCode = http.GET();
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-        // Parse friendly_name
-        int nameIdx = payload.indexOf("\"friendly_name\": \"");
-        if (nameIdx != -1) {
-            int valStart = nameIdx + 18;
-            int valEnd = payload.indexOf("\"", valStart);
-            selectedMediaName = payload.substring(valStart, valEnd);
-        } else {
-            selectedMediaName = entity_id; // Fallback
-        }
-
-        // Parse state
-        int stateIdx = payload.indexOf("\"state\": \"");
-        if (stateIdx != -1) {
-            int valStart = stateIdx + 10;
-            int valEnd = payload.indexOf("\"", valStart);
-            selectedMediaState = payload.substring(valStart, valEnd);
-        }
-        // Parse volume_level
-        int volIdx = payload.indexOf("\"volume_level\": ");
-        if (volIdx != -1) {
-            int valStart = volIdx + 15;
-            int valEnd = payload.indexOf(",", valStart);
-            if (valEnd == -1) valEnd = payload.indexOf("}", valStart);
-            String volStr = payload.substring(valStart, valEnd);
-            selectedMediaVolume = volStr.toFloat();
-        } else {
-            selectedMediaVolume = 0.0;
-        }
-    } else {
-        // Se il recupero fallisce, imposta valori di fallback
-        selectedMediaName = "Errore Player";
-        selectedMediaState = "unavailable";
-        selectedMediaVolume = 0.0;
-    }
-    http.end();
-}
-
-void setMediaVolume(String entity_id, float volume) {
-    if (homeAssistantAddress == "") return;
-    WiFiClient client;
-    HTTPClient http;
-    String apiUrl = homeAssistantAddress + "/api/services/media_player/volume_set";
-    http.begin(client, apiUrl);
-    http.addHeader("Content-Type", "application/json");
-    String jsonPayload = "{\"entity_id\":\"" + entity_id + "\", \"volume_level\":" + String(volume, 2) + "}";
-    http.POST(jsonPayload);
-    http.end();
-}
-
-void controlMediaPlayer(String entity_id, String action) {
-    if (homeAssistantAddress == "") return;
-    WiFiClient client;
-    HTTPClient http;
-    String apiUrl = homeAssistantAddress + "/api/services/media_player/" + action;
-    http.begin(client, apiUrl);
-    http.addHeader("Content-Type", "application/json");
-    String jsonPayload = "{\"entity_id\":\"" + entity_id + "\"}";
-    http.POST(jsonPayload);
-    http.end();
 }
 
 std::vector<CalendarEvent> fetchTodayCalendarEvents() {
@@ -3552,71 +2907,4 @@ void drawWeekView() {
         now_ts += 86400;
         localtime_r(&now_ts, &week_day_tm);
     }
-}
-
-void drawMediaControlPage() {
-    const int header_height = 80;
-    const int col2_start_x = (M5EPD_PANEL_W * 0.3) - 22;
-    const int col2_width = M5EPD_PANEL_W - col2_start_x;
-    
-    // Pulisci area
-    canvas.fillRect(col2_start_x, header_height, col2_width, M5EPD_PANEL_H - header_height, WHITE);
-    
-    // Titolo (Nome Media Player)
-    canvas.setFreeFont(&FreeSansBold18pt7b);
-    canvas.setTextColor(BLACK);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString(selectedMediaName, col2_start_x + col2_width / 2, header_height + 50);
-
-    if (selectedMediaEntity == "") {
-        canvas.setFreeFont(&FreeSans12pt7b);
-        canvas.drawString("Imposta un player predefinito", col2_start_x + col2_width / 2, header_height + 150);
-        canvas.drawString("nella configurazione web.", col2_start_x + col2_width / 2, header_height + 180);
-        canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-        return; // Non disegnare i controlli se nessun player è selezionato
-    }
-    
-    // Pulsanti di controllo
-    int btnY = header_height + 150;
-    int btnW = 100;
-    int btnH = 80;
-    int btnSpacing = (col2_width - (3 * btnW)) / 4;
-
-    int prevX = col2_start_x + btnSpacing;
-    int playX = prevX + btnW + btnSpacing;
-    int nextX = playX + btnW + btnSpacing;
-
-    canvas.setTextDatum(MC_DATUM);
-    canvas.setFreeFont(&FreeSansBold24pt7b);
-
-    // Prev button
-    canvas.drawRect(prevX, btnY, btnW, btnH, BLACK);
-    canvas.drawString("<<", prevX + btnW / 2, btnY + btnH / 2);
-
-    // Play/Pause button
-    String playIcon = (selectedMediaState == "playing") ? "||" : ">";
-    canvas.fillRect(playX, btnY, btnW, btnH, BLACK);
-    canvas.setTextColor(WHITE);
-    canvas.drawString(playIcon, playX + btnW / 2, btnY + btnH / 2);
-    canvas.setTextColor(BLACK);
-
-    // Next button
-    canvas.drawRect(nextX, btnY, btnW, btnH, BLACK);
-    canvas.drawString(">>", nextX + btnW / 2, btnY + btnH / 2);
-    
-    // Slider Volume
-    int slX = col2_start_x + 40;
-    int slY = btnY + btnH + 80;
-    int slW = col2_width - 80;
-    int slH = 40;
-    
-    canvas.drawRect(slX, slY, slW, slH, BLACK);
-    int fillW = selectedMediaVolume * slW;
-    if (fillW > 0) canvas.fillRect(slX, slY, fillW, slH, BLACK);
-    
-    canvas.setFreeFont(&FreeSans12pt7b);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString("Volume: " + String((int)(selectedMediaVolume * 100)) + "%", col2_start_x + col2_width / 2, slY - 30);
-    
-    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
 }
